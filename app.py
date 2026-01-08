@@ -10,10 +10,6 @@ import json
 # Page config
 st.set_page_config(page_title="Weather Routing Calculator", layout="wide")
 
-# Initialize session state
-if 'vessel_data' not in st.session_state:
-    st.session_state.vessel_data = {}
-
 class VesselData:
     """선박 제원 데이터"""
     def __init__(self, displacement, windage_area_front, windage_area_side, 
@@ -323,7 +319,7 @@ def parse_windy_data(weather_data: Dict, target_time: datetime) -> WeatherPoint:
 def calculate_wind_resistance(vessel: VesselData, wind_speed_ms: float, 
                               wind_dir: float, vessel_heading: float) -> float:
     """풍압저항 계산 (kN)"""
-    # Relative wind angle
+    # Relative wind angle (선수 기준)
     relative_angle = (wind_dir - vessel_heading + 360) % 360
     if relative_angle > 180:
         relative_angle = 360 - relative_angle
@@ -331,27 +327,40 @@ def calculate_wind_resistance(vessel: VesselData, wind_speed_ms: float,
     relative_angle_rad = math.radians(relative_angle)
     
     # 항력계수 (각도에 따라 변화)
-    if relative_angle < 45:
-        Cd = 0.75
+    # Head wind (0°): 최대 저항
+    # Beam wind (90°): 중간 저항  
+    # Following wind (180°): 저항 감소 (추진력)
+    if relative_angle < 30:  # Head wind
+        Cd = 0.9
         area = vessel.windage_area_front
-    elif relative_angle < 90:
-        Cd = 0.6
-        area = (vessel.windage_area_front + vessel.windage_area_side) / 2
-    else:
+        direction_factor = 1.0
+    elif relative_angle < 60:
+        Cd = 0.7
+        area = (vessel.windage_area_front * 2 + vessel.windage_area_side) / 3
+        direction_factor = 0.8
+    elif relative_angle < 120:  # Beam wind
         Cd = 0.5
         area = vessel.windage_area_side
+        direction_factor = 0.3  # 횡풍은 속력에 직접적 영향 적음
+    elif relative_angle < 150:
+        Cd = 0.4
+        area = (vessel.windage_area_side + vessel.windage_area_front) / 2
+        direction_factor = -0.1  # 약간의 추진력
+    else:  # Following wind
+        Cd = 0.3
+        area = vessel.windage_area_front
+        direction_factor = -0.2  # 추진력
     
-    # 상대풍속 (선박 속력도 고려해야 하지만 간단히 처리)
     rho_air = 1.225  # kg/m³
     
-    # 풍압저항 (N)
-    R_wind = 0.5 * rho_air * Cd * area * (wind_speed_ms ** 2) * abs(math.cos(relative_angle_rad))
+    # 풍압저항 (N) - 방향 계수 적용
+    R_wind = 0.5 * rho_air * Cd * area * (wind_speed_ms ** 2) * direction_factor
     
-    return R_wind / 1000  # kN
+    return max(0, R_wind / 1000)  # kN, 음수면 0 (추진력은 별도 처리)
 
 def calculate_wave_resistance(vessel: VesselData, wave_height: float, 
                               wave_dir: float, vessel_heading: float) -> float:
-    """파랑저항 계산 (kN) - Kwon 간략식 사용"""
+    """파랑저항 계산 (kN) - 간략화된 Kwon 방법"""
     if wave_height < 0.5:
         return 0
     
@@ -360,56 +369,77 @@ def calculate_wave_resistance(vessel: VesselData, wave_height: float,
     if relative_angle > 180:
         relative_angle = 360 - relative_angle
     
-    relative_angle_rad = math.radians(relative_angle)
+    # 방향 계수: Head sea가 가장 큰 저항
+    if relative_angle < 30:  # Head sea
+        direction_factor = 1.0
+    elif relative_angle < 60:
+        direction_factor = 0.7
+    elif relative_angle < 120:  # Beam sea
+        direction_factor = 0.4
+    elif relative_angle < 150:
+        direction_factor = 0.2
+    else:  # Following sea
+        direction_factor = 0.1
     
     # 간략화된 파랑저항 공식
-    # R_wave = C * B * d * H^2 * cos(μ)
-    # C는 경험계수 (약 20-30)
-    C = 25
+    # 파고 2m 이하에서는 영향이 작음, 4m 이상에서 급격히 증가
+    C = 8  # 경험계수 (낮춤)
     B = vessel.breadth
-    d = vessel.draft
-    H = wave_height
     
-    R_wave = C * B * d * (H ** 2) * abs(math.cos(relative_angle_rad))
+    # 파고에 따른 비선형 효과
+    if wave_height < 2:
+        height_factor = wave_height * 0.5
+    elif wave_height < 4:
+        height_factor = wave_height
+    else:
+        height_factor = wave_height * 1.5
+    
+    R_wave = C * B * (height_factor ** 1.5) * direction_factor
     
     return R_wave  # kN
 
 def calculate_speed_loss(vessel: VesselData, weather: WeatherPoint, 
                         vessel_heading: float) -> float:
-    """속력 손실 계산 (노트)"""
-    total_resistance = 0
+    """속력 손실 계산 (노트) - 현실적인 경험식"""
+    total_added_resistance = 0
     
     # 바람에 의한 저항
     if weather.wind_speed:
         R_wind = calculate_wind_resistance(vessel, weather.wind_speed, 
-                                          weather.wind_dir, vessel_heading)
-        total_resistance += R_wind
+                                          weather.wind_dir or 0, vessel_heading)
+        total_added_resistance += R_wind
     
     # 파도에 의한 저항
     if weather.wave_height:
         R_wave = calculate_wave_resistance(vessel, weather.wave_height,
-                                          weather.wave_dir, vessel_heading)
-        total_resistance += R_wave
+                                          weather.wave_dir or 0, vessel_heading)
+        total_added_resistance += R_wave
     
-    # Swell도 고려
+    # Swell도 고려 (파도보다 영향 적음)
     if weather.swell_height:
         R_swell = calculate_wave_resistance(vessel, weather.swell_height,
                                            weather.swell_dir or weather.wave_dir or 0,
                                            vessel_heading)
-        total_resistance += R_swell * 0.5  # Swell은 wave보다 영향 적음
+        total_added_resistance += R_swell * 0.3
     
-    # 저항을 속력 손실로 변환 (경험식)
-    # 간단한 근사: 저항이 두배가 되면 속력이 약 15% 감소
-    # ΔV = k * (R_added / R_calm)^0.5 * V_calm
+    # 저항을 속력 손실로 변환
+    # 경험식: 선박의 배수량과 속력에 따른 기본 저항 대비 추가 저항 비율
+    # 5000톤급 선박, 11노트 기준 평수중 저항 약 100-150 kN
     
-    # 평수중 저항 추정 (단순화)
-    R_calm = vessel.displacement * 0.01  # 매우 간략한 근사
+    # 배수량에 비례한 기본 저항 추정
+    base_resistance = vessel.displacement * 0.025  # kN (간략 추정)
     
-    speed_loss_factor = math.sqrt(total_resistance / max(R_calm, 1))
-    speed_loss = speed_loss_factor * vessel.speed_knots * 0.15  # 최대 15% 감소
+    # 추가 저항 비율
+    resistance_ratio = total_added_resistance / max(base_resistance, 50)
     
-    # 속력 손실 제한 (0 ~ 4 노트)
-    speed_loss = max(0, min(speed_loss, 4))
+    # 속력 손실: 저항 10% 증가 시 속력 약 3% 감소 (큐빅 관계의 역)
+    # ΔV/V ≈ (1/3) * (ΔR/R)
+    speed_loss_percent = resistance_ratio * 0.33 * 100
+    speed_loss = vessel.speed_knots * (speed_loss_percent / 100)
+    
+    # 현실적인 상한: 극한 상황에서도 최대 25% 손실
+    max_loss = vessel.speed_knots * 0.25
+    speed_loss = max(0, min(speed_loss, max_loss))
     
     return speed_loss
 
@@ -610,16 +640,18 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
         # Pressure
         pressure = f"{weather.pressure:.1f}" if weather and weather.pressure else "N/A"
         
-        # Wind with arrow
+        # Wind with arrow (가는 방향으로 표시하려면 +180도)
         if weather and weather.wind_dir is not None and weather.wind_speed is not None:
-            wind_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wind_dir}deg);">↓</span>'
+            arrow_deg = (weather.wind_dir + 180) % 360
+            wind_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({arrow_deg}deg);">↓</span>'
             wind_str = f'{wind_arrow} {weather.wind_dir:.0f}° / {ms_to_knots(weather.wind_speed):.1f}kt'
         else:
             wind_str = "N/A"
         
-        # Wave with arrow
+        # Wave with arrow (가는 방향으로 표시하려면 +180도)
         if weather and weather.wave_dir is not None and weather.wave_height is not None:
-            wave_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wave_dir}deg);">↓</span>'
+            arrow_deg = (weather.wave_dir + 180) % 360
+            wave_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({arrow_deg}deg);">↓</span>'
             wave_str = f'{wave_arrow} {weather.wave_dir:.0f}° / {weather.wave_height:.1f}m'
         else:
             wave_str = "N/A"
@@ -675,6 +707,20 @@ def create_results_table(dr_positions: List[Dict]) -> pd.DataFrame:
     
     return pd.DataFrame(rows)
 
+# Initialize session state for persistent values
+if 'initialized' not in st.session_state:
+    st.session_state.initialized = True
+    st.session_state.displacement = 5000.0
+    st.session_state.windage_front = 500.0
+    st.session_state.windage_side = 800.0
+    st.session_state.loa = 115.0
+    st.session_state.breadth = 20.0
+    st.session_state.draft = 5.5
+    st.session_state.speed_knots = 11.0
+    st.session_state.dep_tz_idx = 12  # UTC+0
+    st.session_state.arr_tz_idx = 21  # UTC+9
+    st.session_state.calculation_done = False
+
 # Streamlit UI
 st.title("⛵ Weather Routing Calculator")
 st.markdown("---")
@@ -683,17 +729,43 @@ st.markdown("---")
 with st.sidebar:
     st.header("Vessel Data")
     
-    displacement = st.number_input("Displacement (ton)", min_value=100.0, value=5000.0, step=100.0)
-    windage_front = st.number_input("Windage Area Front (m²)", min_value=10.0, value=500.0, step=10.0)
-    windage_side = st.number_input("Windage Area Side (m²)", min_value=10.0, value=800.0, step=10.0)
-    loa = st.number_input("LOA (m)", min_value=10.0, value=115.0, step=1.0)
-    breadth = st.number_input("Breadth (m)", min_value=5.0, value=20.0, step=0.5)
-    draft = st.number_input("Draft (m)", min_value=1.0, value=5.5, step=0.1)
+    displacement = st.number_input("Displacement (ton)", min_value=100.0, 
+                                   value=st.session_state.displacement, step=100.0,
+                                   key="input_displacement")
+    st.session_state.displacement = displacement
+    
+    windage_front = st.number_input("Windage Area Front (m²)", min_value=10.0, 
+                                    value=st.session_state.windage_front, step=10.0,
+                                    key="input_windage_front")
+    st.session_state.windage_front = windage_front
+    
+    windage_side = st.number_input("Windage Area Side (m²)", min_value=10.0, 
+                                   value=st.session_state.windage_side, step=10.0,
+                                   key="input_windage_side")
+    st.session_state.windage_side = windage_side
+    
+    loa = st.number_input("LOA (m)", min_value=10.0, 
+                          value=st.session_state.loa, step=1.0,
+                          key="input_loa")
+    st.session_state.loa = loa
+    
+    breadth = st.number_input("Breadth (m)", min_value=5.0, 
+                              value=st.session_state.breadth, step=0.5,
+                              key="input_breadth")
+    st.session_state.breadth = breadth
+    
+    draft = st.number_input("Draft (m)", min_value=1.0, 
+                            value=st.session_state.draft, step=0.1,
+                            key="input_draft")
+    st.session_state.draft = draft
     
     st.markdown("---")
     st.header("Voyage Data")
     
-    speed_knots = st.number_input("Speed through water (knots)", min_value=1.0, value=11.0, step=0.5)
+    speed_knots = st.number_input("Speed through water (knots)", min_value=1.0, 
+                                  value=st.session_state.speed_knots, step=0.5,
+                                  key="input_speed")
+    st.session_state.speed_knots = speed_knots
     
     # Time Zone 옵션 생성 (-12 ~ +13)
     tz_options = [f"UTC{'+' if i >= 0 else ''}{i}" for i in range(-12, 14)]
@@ -702,11 +774,17 @@ with st.sidebar:
     col_dep, col_arr = st.columns(2)
     with col_dep:
         dep_tz_idx = st.selectbox("Departure Zone", options=range(len(tz_options)), 
-                                   format_func=lambda x: tz_options[x], index=12)  # UTC+0 기본값
+                                   format_func=lambda x: tz_options[x], 
+                                   index=st.session_state.dep_tz_idx,
+                                   key="input_dep_tz")
+        st.session_state.dep_tz_idx = dep_tz_idx
         departure_tz = tz_values[dep_tz_idx]
     with col_arr:
         arr_tz_idx = st.selectbox("Arrival Zone", options=range(len(tz_options)), 
-                                   format_func=lambda x: tz_options[x], index=21)  # UTC+9 기본값 (한국)
+                                   format_func=lambda x: tz_options[x], 
+                                   index=st.session_state.arr_tz_idx,
+                                   key="input_arr_tz")
+        st.session_state.arr_tz_idx = arr_tz_idx
         arrival_tz = tz_values[arr_tz_idx]
     
     departure_date = st.date_input("Departure Date (LT)", datetime.now().date())
@@ -729,8 +807,9 @@ with st.sidebar:
     st.header("Debug Options")
     show_debug = st.checkbox("Show API response keys", value=False)
 
-# Main area - Expander로 접을 수 있게
-with st.expander("📁 Upload GPX Track & Actions", expanded=True):
+# Main area - 계산 완료 후에는 접힌 상태로
+upload_expanded = not st.session_state.calculation_done
+with st.expander("📁 Upload GPX Track & Actions", expanded=upload_expanded):
     col1, col2 = st.columns([2, 1])
     
     with col1:
@@ -798,6 +877,12 @@ if calculate_button and gpx_file and api_key:
             # 결과 표시
             st.success("✅ Weather routing calculation completed!")
         
+        # 계산 완료 플래그 설정
+        st.session_state.calculation_done = True
+        st.session_state.final_dr = final_dr
+        st.session_state.departure_datetime = departure_datetime
+        st.session_state.arrival_tz = arrival_tz
+        
         st.markdown("---")
         
         st.header("📊 Routing Results")
@@ -840,6 +925,41 @@ elif calculate_button:
         st.warning("⚠️ Please upload a GPX file")
     if not api_key:
         st.warning("⚠️ Please provide Windy API key")
+
+# 이전 계산 결과가 있으면 표시 (새로 계산하지 않은 경우)
+elif st.session_state.calculation_done and 'final_dr' in st.session_state and not calculate_button:
+    final_dr = st.session_state.final_dr
+    departure_datetime = st.session_state.departure_datetime
+    arrival_tz = st.session_state.arrival_tz
+    
+    st.markdown("---")
+    st.header("📊 Routing Results")
+    
+    # 요약 정보
+    eta_utc = final_dr[-1]['time']
+    eta_arr_local = eta_utc + timedelta(hours=arrival_tz)
+    voyage_time = (eta_utc - departure_datetime).total_seconds() / 3600
+    avg_speed = final_dr[-1]['distance_sailed'] / voyage_time if voyage_time > 0 else 0
+    
+    tz_label = f"UTC{'+' if arrival_tz >= 0 else ''}{arrival_tz}"
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Distance", f"{final_dr[-1]['distance_sailed']:.1f} nm")
+    with col2:
+        st.metric(f"ETA ({tz_label})", eta_arr_local.strftime('%m/%d %H:%M'))
+    with col3:
+        st.metric("Voyage Time", f"{voyage_time:.1f} hrs")
+    with col4:
+        st.metric("Avg Speed", f"{avg_speed:.1f} kt")
+    
+    # 테이블 표시 (HTML with rotated arrows)
+    st.subheader("Detailed Forecast")
+    table_html = create_results_table_html(final_dr)
+    
+    import streamlit.components.v1 as components
+    table_height = min(600, 50 + len(final_dr) * 40)
+    components.html(table_html, height=table_height, scrolling=True)
 
 # Footer
 st.markdown("---")
