@@ -6,6 +6,9 @@ import math
 import pandas as pd
 from typing import List, Tuple, Dict
 import json
+import folium
+from streamlit_folium import st_folium
+from folium.plugins import AntPath
 
 # Page config - must be first Streamlit command
 st.set_page_config(page_title="Weather Routing Calculator", layout="wide")
@@ -761,6 +764,120 @@ def create_results_table(dr_positions: List[Dict]) -> pd.DataFrame:
     
     return pd.DataFrame(rows)
 
+def create_route_map(track_points: List[Tuple[float, float]], dr_positions: List[Dict]) -> folium.Map:
+    """GPX 트랙과 DR 위치를 표시하는 지도 생성"""
+    
+    # 지도 중심점 계산
+    all_lats = [p[0] for p in track_points] + [p['lat'] for p in dr_positions]
+    all_lons = [p[1] for p in track_points] + [p['lon'] for p in dr_positions]
+    center_lat = sum(all_lats) / len(all_lats)
+    center_lon = sum(all_lons) / len(all_lons)
+    
+    # 지도 생성
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=6,
+        tiles='CartoDB positron'
+    )
+    
+    # 경계 맞추기
+    sw = [min(all_lats), min(all_lons)]
+    ne = [max(all_lats), max(all_lons)]
+    m.fit_bounds([sw, ne], padding=[20, 20])
+    
+    # GPX 트랙 라인 (계획 항로) - 회색 점선
+    track_coords = [[p[0], p[1]] for p in track_points]
+    folium.PolyLine(
+        track_coords,
+        weight=3,
+        color='gray',
+        dash_array='10',
+        opacity=0.7,
+        tooltip='Planned Route'
+    ).add_to(m)
+    
+    # DR 항로 라인 (예상 항로) - 파란색 실선, 애니메이션
+    dr_coords = [[p['lat'], p['lon']] for p in dr_positions]
+    AntPath(
+        dr_coords,
+        weight=4,
+        color='#2E86AB',
+        pulse_color='#A5D8FF',
+        delay=1000,
+        opacity=0.8
+    ).add_to(m)
+    
+    # DR 위치 마커
+    for i, point in enumerate(dr_positions):
+        weather = point.get('weather')
+        
+        # 팝업 내용 생성
+        popup_html = f"""
+        <div style="font-family: Arial, sans-serif; font-size: 12px; min-width: 180px;">
+            <b style="font-size: 14px;">DR Position #{i}</b><br>
+            <hr style="margin: 5px 0;">
+            <b>ETA (UTC):</b> {point['time'].strftime('%Y-%m-%d %H:%M')}<br>
+            <b>Position:</b> {point['lat']:.4f}°, {point['lon']:.4f}°<br>
+            <b>Course:</b> {point.get('heading', 0):.0f}°<br>
+            <b>Distance Sailed:</b> {point['distance_sailed']:.1f} nm<br>
+            <b>Remaining:</b> {point['distance_remaining']:.1f} nm<br>
+        """
+        
+        if weather:
+            # Pressure 변환
+            pressure_val = weather.pressure if weather.pressure else 0
+            if pressure_val > 10000:
+                pressure_val = pressure_val / 100
+            
+            popup_html += f"""
+            <hr style="margin: 5px 0;">
+            <b style="color: #2E86AB;">Weather Forecast</b><br>
+            <b>Pressure:</b> {pressure_val:.0f} hPa<br>
+            """
+            
+            if weather.wind_dir is not None and weather.wind_speed is not None:
+                popup_html += f"<b>Wind:</b> {weather.wind_dir:.0f}° / {ms_to_knots(weather.wind_speed):.1f} kt<br>"
+            
+            if weather.wave_dir is not None and weather.wave_height is not None:
+                popup_html += f"<b>Wave:</b> {weather.wave_dir:.0f}° / {weather.wave_height:.1f} m<br>"
+            
+            if point.get('actual_speed'):
+                popup_html += f"<b>Est. Speed:</b> {point['actual_speed']:.1f} kt<br>"
+        
+        popup_html += "</div>"
+        
+        # 마커 색상: 출발(녹색), 도착(빨강), 중간(파랑)
+        if i == 0:
+            icon_color = 'green'
+            icon = 'play'
+        elif i == len(dr_positions) - 1:
+            icon_color = 'red'
+            icon = 'flag'
+        else:
+            icon_color = 'blue'
+            icon = 'info-sign'
+        
+        folium.Marker(
+            location=[point['lat'], point['lon']],
+            popup=folium.Popup(popup_html, max_width=250),
+            tooltip=f"DR #{i}: {point['time'].strftime('%m/%d %H:%M')} UTC",
+            icon=folium.Icon(color=icon_color, icon=icon)
+        ).add_to(m)
+    
+    # GPX 경유점 마커 (작은 원)
+    for i, point in enumerate(track_points):
+        folium.CircleMarker(
+            location=[point[0], point[1]],
+            radius=5,
+            color='gray',
+            fill=True,
+            fill_color='white',
+            fill_opacity=0.8,
+            tooltip=f"Waypoint #{i+1}"
+        ).add_to(m)
+    
+    return m
+
 # Initialize session state with localStorage values
 if 'initialized' not in st.session_state:
     st.session_state.initialized = True
@@ -952,6 +1069,7 @@ if calculate_button and gpx_file and api_key:
         # 계산 완료 플래그 설정
         st.session_state.calculation_done = True
         st.session_state.final_dr = final_dr
+        st.session_state.track_points = track_points
         st.session_state.departure_datetime = departure_datetime
         st.session_state.arrival_tz = arrival_tz
         
@@ -977,8 +1095,13 @@ if calculate_button and gpx_file and api_key:
         with col4:
             st.metric("Avg Speed", f"{avg_speed:.1f} kt")
         
+        # 지도 표시
+        st.subheader("🗺️ Route Map")
+        route_map = create_route_map(track_points, final_dr)
+        st_folium(route_map, width=None, height=500, use_container_width=True)
+        
         # 테이블 표시 (HTML with rotated arrows)
-        st.subheader("Detailed Forecast")
+        st.subheader("📋 Detailed Forecast")
         table_html = create_results_table_html(final_dr)
         
         # st.components.v1.html 사용하여 HTML 렌더링
@@ -1001,6 +1124,7 @@ elif calculate_button:
 # 이전 계산 결과가 있으면 표시 (새로 계산하지 않은 경우)
 elif st.session_state.calculation_done and 'final_dr' in st.session_state and not calculate_button:
     final_dr = st.session_state.final_dr
+    track_points = st.session_state.get('track_points', [])
     departure_datetime = st.session_state.departure_datetime
     arrival_tz = st.session_state.arrival_tz
     
@@ -1025,8 +1149,14 @@ elif st.session_state.calculation_done and 'final_dr' in st.session_state and no
     with col4:
         st.metric("Avg Speed", f"{avg_speed:.1f} kt")
     
+    # 지도 표시 (track_points가 있을 때만)
+    if track_points:
+        st.subheader("🗺️ Route Map")
+        route_map = create_route_map(track_points, final_dr)
+        st_folium(route_map, width=None, height=500, use_container_width=True)
+    
     # 테이블 표시 (HTML with rotated arrows)
-    st.subheader("Detailed Forecast")
+    st.subheader("📋 Detailed Forecast")
     table_html = create_results_table_html(final_dr)
     
     import streamlit.components.v1 as components
