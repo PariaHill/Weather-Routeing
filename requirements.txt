@@ -2,4 +2,3 @@ streamlit>=1.31.0
 gpxpy>=1.6.0
 requests>=2.31.0
 pandas>=2.1.0
-streamlit-local-storage>=1.0.0
