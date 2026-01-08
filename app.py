@@ -680,6 +680,7 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
                 <th>Pressure</th>
                 <th>Wind</th>
                 <th>Wave</th>
+                <th>Max Wave</th>
                 <th>Sailed</th>
                 <th>Remaining</th>
                 <th>Est. Speed</th>
@@ -722,8 +723,12 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
         if weather and weather.wave_dir is not None and weather.wave_height is not None:
             wave_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wave_dir}deg);">↓</span>'
             wave_str = f'{wave_arrow} {weather.wave_dir:.0f}° / {weather.wave_height:.1f}m'
+            # Max Wave (레일리 분포 x1.6)
+            max_wave = weather.wave_height * 1.6
+            max_wave_str = f"{max_wave:.1f}m"
         else:
             wave_str = "N/A"
+            max_wave_str = "N/A"
         
         sailed = f"{point['distance_sailed']:.1f}"
         remaining = f"{point['distance_remaining']:.1f}"
@@ -738,6 +743,7 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
                 <td>{pressure}</td>
                 <td>{wind_str}</td>
                 <td>{wave_str}</td>
+                <td>{max_wave_str}</td>
                 <td>{sailed}</td>
                 <td>{remaining}</td>
                 <td>{est_speed}</td>
@@ -845,15 +851,18 @@ def create_route_map(track_points: List[Tuple[float, float]], dr_positions: List
     # DR 위치 마커
     for i, point in enumerate(dr_positions):
         weather = point.get('weather')
-        weather = point.get('weather')
+        
+        # 좌표 포맷
+        lat_str = decimal_to_dms(point['lat'], is_lat=True)
+        lon_str = decimal_to_dms(point['lon'], is_lat=False)
         
         # 팝업 내용 생성
         popup_html = f"""
-        <div style="font-family: Arial, sans-serif; font-size: 12px; min-width: 180px;">
+        <div style="font-family: Arial, sans-serif; font-size: 12px; min-width: 200px;">
             <b style="font-size: 14px;">DR Position #{i}</b><br>
             <hr style="margin: 5px 0;">
             <b>ETA (UTC):</b> {point['time'].strftime('%Y-%m-%d %H:%M')}<br>
-            <b>Position:</b> {point['lat']:.4f}°, {point['lon']:.4f}°<br>
+            <b>Position:</b> {lat_str}, {lon_str}<br>
             <b>Course:</b> {point.get('heading', 0):.0f}°<br>
             <b>Distance Sailed:</b> {point['distance_sailed']:.1f} nm<br>
             <b>Remaining:</b> {point['distance_remaining']:.1f} nm<br>
@@ -875,12 +884,27 @@ def create_route_map(track_points: List[Tuple[float, float]], dr_positions: List
                 popup_html += f"<b>Wind:</b> {weather.wind_dir:.0f}° / {ms_to_knots(weather.wind_speed):.1f} kt<br>"
             
             if weather.wave_dir is not None and weather.wave_height is not None:
+                max_wave = weather.wave_height * 1.6  # 레일리 분포
                 popup_html += f"<b>Wave:</b> {weather.wave_dir:.0f}° / {weather.wave_height:.1f} m<br>"
+                popup_html += f"<b>Max Wave:</b> {max_wave:.1f} m<br>"
             
             if point.get('actual_speed'):
                 popup_html += f"<b>Est. Speed:</b> {point['actual_speed']:.1f} kt<br>"
         
         popup_html += "</div>"
+        
+        # Tooltip 내용 생성 (마우스 오버시 표시)
+        tooltip_lines = [f"DR #{i}: {point['time'].strftime('%Y-%m-%d %H:%M')} UTC"]
+        tooltip_lines.append(f"Position: {lat_str}, {lon_str}")
+        
+        if weather:
+            if weather.wind_dir is not None and weather.wind_speed is not None:
+                tooltip_lines.append(f"Wind: {weather.wind_dir:.0f}° / {ms_to_knots(weather.wind_speed):.1f} kt")
+            if weather.wave_dir is not None and weather.wave_height is not None:
+                max_wave = weather.wave_height * 1.6
+                tooltip_lines.append(f"Wave: {weather.wave_height:.1f} m (Max: {max_wave:.1f} m)")
+        
+        tooltip_text = "<br>".join(tooltip_lines)
         
         # 마커 색상: 출발(녹색), 도착(빨강), 중간(파랑)
         if i == 0:
@@ -896,7 +920,7 @@ def create_route_map(track_points: List[Tuple[float, float]], dr_positions: List
         folium.Marker(
             location=[point['lat'], point['lon']],
             popup=folium.Popup(popup_html, max_width=250),
-            tooltip=f"DR #{i}: {point['time'].strftime('%m/%d %H:%M')} UTC",
+            tooltip=folium.Tooltip(tooltip_text),
             icon=folium.Icon(color=icon_color, icon=icon)
         ).add_to(m)
     
