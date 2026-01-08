@@ -6,6 +6,14 @@ import math
 import pandas as pd
 from typing import List, Tuple, Dict
 import json
+from streamlit_local_storage import LocalStorage
+ls = LocalStorage()
+
+# 저장
+ls.setItem("vessel_displacement", displacement)
+
+# 불러오기
+saved_value = ls.getItem("vessel_displacement")
 
 # Page config
 st.set_page_config(page_title="Weather Routing Calculator", layout="wide")
@@ -121,6 +129,10 @@ def calculate_initial_dr_positions(track_points: List[Tuple[float, float]],
                                  track_points[i+1][0], track_points[i+1][1])
         total_distance += dist
     
+    # 시작점 heading (첫 번째 경유점 방향)
+    initial_heading = calculate_bearing(track_points[0][0], track_points[0][1],
+                                        track_points[1][0], track_points[1][1])
+    
     # 시작점
     current_time = start_time
     current_lat, current_lon = track_points[0]
@@ -129,7 +141,8 @@ def calculate_initial_dr_positions(track_points: List[Tuple[float, float]],
         'lat': current_lat,
         'lon': current_lon,
         'distance_sailed': 0,
-        'distance_remaining': total_distance
+        'distance_remaining': total_distance,
+        'heading': initial_heading
     })
     
     # 6시간 간격으로 DR 계산
@@ -145,9 +158,13 @@ def calculate_initial_dr_positions(track_points: List[Tuple[float, float]],
             # 목적지 도달
             current_lat, current_lon = track_points[-1]
             distance_remaining = 0
+            # 마지막 heading은 이전 구간의 방향 유지
+            heading = calculate_bearing(track_points[-2][0], track_points[-2][1],
+                                       track_points[-1][0], track_points[-1][1])
         else:
             # 현재 구간에서 위치 찾기
             accumulated_dist = 0
+            heading = initial_heading
             for i in range(track_idx, len(track_points) - 1):
                 seg_dist = calculate_distance(track_points[i][0], track_points[i][1],
                                              track_points[i+1][0], track_points[i+1][1])
@@ -157,6 +174,7 @@ def calculate_initial_dr_positions(track_points: List[Tuple[float, float]],
                     remaining_in_seg = distance_to_sail - accumulated_dist
                     bearing = calculate_bearing(track_points[i][0], track_points[i][1],
                                               track_points[i+1][0], track_points[i+1][1])
+                    heading = bearing
                     current_lat, current_lon = rhumb_line_destination(
                         track_points[i][0], track_points[i][1], bearing, remaining_in_seg
                     )
@@ -172,7 +190,8 @@ def calculate_initial_dr_positions(track_points: List[Tuple[float, float]],
             'lat': current_lat,
             'lon': current_lon,
             'distance_sailed': distance_sailed,
-            'distance_remaining': distance_remaining
+            'distance_remaining': distance_remaining,
+            'heading': heading
         })
         
         if distance_sailed >= total_distance:
@@ -620,6 +639,7 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
                 <th>ETA (UTC)</th>
                 <th>Latitude</th>
                 <th>Longitude</th>
+                <th>Course</th>
                 <th>Pressure</th>
                 <th>Wind</th>
                 <th>Wave</th>
@@ -631,11 +651,19 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
         <tbody>
     '''
     
-    for point in dr_positions:
+    for i, point in enumerate(dr_positions):
         weather = point.get('weather')
         utc_time = point['time'].strftime('%Y-%m-%d %H:%M')
         lat_str = decimal_to_dms(point['lat'], is_lat=True)
         lon_str = decimal_to_dms(point['lon'], is_lat=False)
+        
+        # Course (heading) with arrow
+        heading = point.get('heading')
+        if heading is not None:
+            course_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({heading}deg);">↓</span>'
+            course_str = f'{course_arrow} {heading:.0f}°'
+        else:
+            course_str = "N/A"
         
         # Pressure
         pressure = f"{weather.pressure:.1f}" if weather and weather.pressure else "N/A"
@@ -665,6 +693,7 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
                 <td>{utc_time}</td>
                 <td>{lat_str}</td>
                 <td>{lon_str}</td>
+                <td>{course_str}</td>
                 <td>{pressure}</td>
                 <td>{wind_str}</td>
                 <td>{wave_str}</td>
