@@ -276,6 +276,7 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
                                 interval_hours: int = 6) -> List[Dict]:
     """
     Step 4: 기상 영향을 반영하여 DR 재계산 (트랙 라인 위에서만)
+    마지막에 정확한 도착점과 ETA 추가
     """
     new_dr = []
     current_time = start_time
@@ -311,11 +312,30 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
         
         # 이 구간 동안 항해한 거리
         distance_this_interval = actual_speed * interval_hours
+        prev_distance = distance_sailed
         distance_sailed += distance_this_interval
         
-        # 트랙 끝을 넘어가면 조정
+        # 트랙 끝에 도달했는지 확인
         if distance_sailed >= track.total_distance:
-            distance_sailed = track.total_distance
+            # 정확한 도착 시간 계산
+            remaining_distance = track.total_distance - prev_distance
+            time_to_arrival = remaining_distance / actual_speed  # 시간 (hours)
+            arrival_time = prev_point['time'] + timedelta(hours=time_to_arrival)
+            
+            # 도착점 추가
+            lat, lon, heading = track.get_position_at_distance(track.total_distance)
+            new_dr.append({
+                'time': arrival_time,
+                'lat': lat,
+                'lon': lon,
+                'distance_sailed': track.total_distance,
+                'distance_remaining': 0,
+                'heading': heading,
+                'weather': orig_point.get('weather'),
+                'actual_speed': actual_speed,
+                'speed_loss': speed_loss
+            })
+            break
         
         # 트랙 상의 새 위치
         lat, lon, heading = track.get_position_at_distance(distance_sailed)
@@ -330,13 +350,37 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
             'distance_sailed': distance_sailed,
             'distance_remaining': track.total_distance - distance_sailed,
             'heading': heading,
-            'weather': orig_point.get('weather'),  # 기존 기상 데이터 임시 사용
+            'weather': orig_point.get('weather'),
             'actual_speed': actual_speed,
             'speed_loss': speed_loss
         })
+    
+    # 마지막 포인트가 도착점이 아니면 도착점 추가
+    last_point = new_dr[-1]
+    if last_point['distance_remaining'] > 0.1:  # 0.1nm 이상 남았으면
+        # 마지막 구간의 속도로 도착 시간 계산
+        weather = last_point.get('weather')
+        if weather:
+            speed_loss = calculate_speed_loss(vessel, weather, last_point['heading'])
+        else:
+            speed_loss = 0
         
-        if distance_sailed >= track.total_distance:
-            break
+        actual_speed = max(vessel.speed_knots - speed_loss, 3)
+        time_to_arrival = last_point['distance_remaining'] / actual_speed
+        arrival_time = last_point['time'] + timedelta(hours=time_to_arrival)
+        
+        lat, lon, heading = track.get_position_at_distance(track.total_distance)
+        new_dr.append({
+            'time': arrival_time,
+            'lat': lat,
+            'lon': lon,
+            'distance_sailed': track.total_distance,
+            'distance_remaining': 0,
+            'heading': heading,
+            'weather': last_point.get('weather'),
+            'actual_speed': actual_speed,
+            'speed_loss': speed_loss
+        })
     
     return new_dr
 
