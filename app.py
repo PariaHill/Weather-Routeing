@@ -72,7 +72,19 @@ class WeatherPoint:
 
 def parse_gpx(gpx_file) -> List[Tuple[float, float]]:
     """GPX 파일에서 포인트 추출 (트랙, 루트, 웨이포인트 모두 지원)"""
-    gpx = gpxpy.parse(gpx_file)
+    try:
+        # 파일 내용 읽기
+        if hasattr(gpx_file, 'read'):
+            content = gpx_file.read()
+            if isinstance(content, bytes):
+                content = content.decode('utf-8')
+            gpx_file.seek(0)  # 파일 포인터 리셋
+        
+        gpx = gpxpy.parse(gpx_file)
+    except Exception as e:
+        st.error(f"GPX parsing error: {str(e)}")
+        return []
+    
     points = []
     
     # 1. 트랙 포인트 (tracks > segments > points)
@@ -408,8 +420,10 @@ def get_windy_weather(lat: float, lon: float, api_key: str) -> Dict:
         if gfs_response.status_code == 200:
             gfs_data = gfs_response.json()
             weather_data['gfs'] = gfs_data
+        else:
+            weather_data['gfs_error'] = f"Status: {gfs_response.status_code}, Response: {gfs_response.text[:200]}"
     except Exception as e:
-        st.warning(f"GFS data fetch failed: {e}")
+        weather_data['gfs_error'] = f"Exception: {str(e)}"
     
     # GFS Wave 모델
     try:
@@ -432,10 +446,9 @@ def get_windy_weather(lat: float, lon: float, api_key: str) -> Dict:
             wave_data = wave_response.json()
             weather_data['wave'] = wave_data
         else:
-            # 디버그: 응답 상태 확인
-            weather_data['wave_error'] = f"Status: {wave_response.status_code}"
+            weather_data['wave_error'] = f"Status: {wave_response.status_code}, Response: {wave_response.text[:200]}"
     except Exception as e:
-        st.warning(f"Wave data fetch failed: {e}")
+        weather_data['wave_error'] = f"Exception: {str(e)}"
     
     return weather_data
 
@@ -1156,15 +1169,19 @@ if calculate_button and gpx_file and api_key:
             initial_dr = fetch_weather_for_positions(initial_dr, api_key)
             
             # 디버그: API 응답 키 확인
-            if show_debug and initial_dr and len(initial_dr) > 1 and 'weather' in initial_dr[1]:
+            if show_debug and initial_dr and len(initial_dr) > 1:
                 test_weather = get_windy_weather(initial_dr[1]['lat'], initial_dr[1]['lon'], api_key)
-                with st.expander("🔍 Debug: API Response Keys", expanded=False):
+                with st.expander("🔍 Debug: API Response", expanded=True):
                     if 'gfs' in test_weather:
+                        st.success("✅ GFS API OK")
                         st.write("**GFS Keys:**", list(test_weather['gfs'].keys()))
+                    if 'gfs_error' in test_weather:
+                        st.error(f"❌ GFS Error: {test_weather['gfs_error']}")
                     if 'wave' in test_weather:
+                        st.success("✅ Wave API OK")
                         st.write("**Wave Keys:**", list(test_weather['wave'].keys()))
                     if 'wave_error' in test_weather:
-                        st.write("**Wave Error:**", test_weather['wave_error'])
+                        st.error(f"❌ Wave Error: {test_weather['wave_error']}")
             
             # Step 4: 기상 영향 반영하여 DR 재계산
             st.info("🔄 Recalculating DR with weather effects...")
