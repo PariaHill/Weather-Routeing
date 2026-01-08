@@ -823,7 +823,13 @@ if calculate_button and gpx_file and api_key:
         # 테이블 표시 (HTML with rotated arrows)
         st.subheader("Detailed Forecast")
         table_html = create_results_table_html(final_dr)
-        st.markdown(table_html, unsafe_allow_html=True)
+        
+        # st.components.v1.html 사용하여 HTML 렌더링
+        import streamlit.components.v1 as components
+        
+        # 테이블 행 수에 따라 높이 동적 계산
+        table_height = min(600, 50 + len(final_dr) * 40)
+        components.html(table_html, height=table_height, scrolling=True)
         
     except Exception as e:
         st.error(f"❌ Error: {str(e)}")
