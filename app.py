@@ -521,32 +521,153 @@ def ms_to_knots(ms: float) -> float:
     """m/s를 노트로 변환"""
     return ms * 1.94384
 
-def create_results_table(dr_positions: List[Dict], dep_tz: int = 0, arr_tz: int = 0) -> pd.DataFrame:
-    """결과 테이블 생성"""
-    rows = []
+def decimal_to_dms(decimal_deg: float, is_lat: bool) -> str:
+    """십진수 좌표를 ddd mm.mm N/S/E/W 형식으로 변환"""
+    if is_lat:
+        direction = 'N' if decimal_deg >= 0 else 'S'
+    else:
+        direction = 'E' if decimal_deg >= 0 else 'W'
+    
+    decimal_deg = abs(decimal_deg)
+    degrees = int(decimal_deg)
+    minutes = (decimal_deg - degrees) * 60
+    
+    if is_lat:
+        return f"{degrees:02d} {minutes:05.2f} {direction}"
+    else:
+        return f"{degrees:03d} {minutes:05.2f} {direction}"
+
+def create_arrow_svg(degrees: float, size: int = 16) -> str:
+    """방향(degrees)에 해당하는 회전된 SVG 화살표 생성 (바람/파도가 오는 방향)"""
+    if degrees is None:
+        return ""
+    
+    # SVG 화살표 - 아래를 가리키는 화살표 (0° = 북에서 오는 바람)
+    # degrees 만큼 회전
+    svg = f'''<svg width="{size}" height="{size}" viewBox="0 0 24 24" style="vertical-align: middle; transform: rotate({degrees}deg);">
+        <path d="M12 2 L12 22 M12 22 L6 16 M12 22 L18 16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>'''
+    return svg
+
+def create_results_table_html(dr_positions: List[Dict]) -> str:
+    """결과 테이블을 HTML로 생성 (SVG 화살표 포함)"""
+    
+    html = '''
+    <style>
+        .weather-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }
+        .weather-table th {
+            background-color: #f0f2f6;
+            padding: 8px 12px;
+            text-align: left;
+            border-bottom: 2px solid #ddd;
+            white-space: nowrap;
+        }
+        .weather-table td {
+            padding: 8px 12px;
+            border-bottom: 1px solid #eee;
+            white-space: nowrap;
+        }
+        .weather-table tr:hover {
+            background-color: #f8f9fa;
+        }
+        .arrow-cell {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .arrow-svg {
+            display: inline-block;
+            vertical-align: middle;
+        }
+    </style>
+    <table class="weather-table">
+        <thead>
+            <tr>
+                <th>ETA (UTC)</th>
+                <th>Latitude</th>
+                <th>Longitude</th>
+                <th>Pressure</th>
+                <th>Wind</th>
+                <th>Wave</th>
+                <th>Sailed</th>
+                <th>Remaining</th>
+                <th>Est. Speed</th>
+            </tr>
+        </thead>
+        <tbody>
+    '''
     
     for point in dr_positions:
         weather = point.get('weather')
+        utc_time = point['time'].strftime('%Y-%m-%d %H:%M')
+        lat_str = decimal_to_dms(point['lat'], is_lat=True)
+        lon_str = decimal_to_dms(point['lon'], is_lat=False)
         
-        # UTC 시간
+        # Pressure
+        pressure = f"{weather.pressure:.1f}" if weather and weather.pressure else "N/A"
+        
+        # Wind with arrow
+        if weather and weather.wind_dir is not None and weather.wind_speed is not None:
+            wind_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wind_dir}deg);">↓</span>'
+            wind_str = f'{wind_arrow} {weather.wind_dir:.0f}° / {ms_to_knots(weather.wind_speed):.1f}kt'
+        else:
+            wind_str = "N/A"
+        
+        # Wave with arrow
+        if weather and weather.wave_dir is not None and weather.wave_height is not None:
+            wave_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wave_dir}deg);">↓</span>'
+            wave_str = f'{wave_arrow} {weather.wave_dir:.0f}° / {weather.wave_height:.1f}m'
+        else:
+            wave_str = "N/A"
+        
+        sailed = f"{point['distance_sailed']:.1f}"
+        remaining = f"{point['distance_remaining']:.1f}"
+        est_speed = f"{point.get('actual_speed', 0):.1f}" if 'actual_speed' in point else "N/A"
+        
+        html += f'''
+            <tr>
+                <td>{utc_time}</td>
+                <td>{lat_str}</td>
+                <td>{lon_str}</td>
+                <td>{pressure}</td>
+                <td>{wind_str}</td>
+                <td>{wave_str}</td>
+                <td>{sailed}</td>
+                <td>{remaining}</td>
+                <td>{est_speed}</td>
+            </tr>
+        '''
+    
+    html += '''
+        </tbody>
+    </table>
+    '''
+    
+    return html
+
+def create_results_table(dr_positions: List[Dict]) -> pd.DataFrame:
+    """결과 테이블 생성 (DataFrame 버전 - fallback용)"""
+    rows = []
+    
+    for i, point in enumerate(dr_positions):
+        weather = point.get('weather')
         utc_time = point['time']
-        # 출발지/도착지 로컬 시간
-        dep_local = utc_time + timedelta(hours=dep_tz)
-        arr_local = utc_time + timedelta(hours=arr_tz)
+        lat_str = decimal_to_dms(point['lat'], is_lat=True)
+        lon_str = decimal_to_dms(point['lon'], is_lat=False)
         
         row = {
-            'Time (UTC)': utc_time.strftime('%Y-%m-%d %H:%M'),
-            'Dep LT': dep_local.strftime('%m-%d %H:%M'),
-            'Arr LT': arr_local.strftime('%m-%d %H:%M'),
-            'Latitude': f"{point['lat']:.4f}",
-            'Longitude': f"{point['lon']:.4f}",
+            'ETA (UTC)': utc_time.strftime('%Y-%m-%d %H:%M'),
+            'Latitude': lat_str,
+            'Longitude': lon_str,
             'Pressure (hPa)': f"{weather.pressure:.1f}" if weather and weather.pressure else "N/A",
-            'Wind Dir (°)': f"{weather.wind_dir:.0f}" if weather and weather.wind_dir else "N/A",
-            'Wind Speed (kt)': f"{ms_to_knots(weather.wind_speed):.1f}" if weather and weather.wind_speed else "N/A",
-            'Wave Dir (°)': f"{weather.wave_dir:.0f}" if weather and weather.wave_dir else "N/A",
-            'Wave Height (m)': f"{weather.wave_height:.1f}" if weather and weather.wave_height else "N/A",
-            'Distance Sailed (nm)': f"{point['distance_sailed']:.1f}",
-            'Distance Remaining (nm)': f"{point['distance_remaining']:.1f}",
+            'Wind': f"{weather.wind_dir:.0f}° / {ms_to_knots(weather.wind_speed):.1f}kt" if weather and weather.wind_dir and weather.wind_speed else "N/A",
+            'Wave': f"{weather.wave_dir:.0f}° / {weather.wave_height:.1f}m" if weather and weather.wave_dir and weather.wave_height else "N/A",
+            'Sailed (nm)': f"{point['distance_sailed']:.1f}",
+            'Remaining (nm)': f"{point['distance_remaining']:.1f}",
             'Est. Speed (kt)': f"{point.get('actual_speed', 0):.1f}" if 'actual_speed' in point else "N/A"
         }
         
@@ -687,34 +808,22 @@ if calculate_button and gpx_file and api_key:
         voyage_time = (eta_utc - departure_datetime).total_seconds() / 3600
         avg_speed = final_dr[-1]['distance_sailed'] / voyage_time if voyage_time > 0 else 0
         
+        tz_label = f"UTC{'+' if arrival_tz >= 0 else ''}{arrival_tz}"
+        
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Total Distance", f"{final_dr[-1]['distance_sailed']:.1f} nm")
         with col2:
-            st.metric("ETA (UTC)", eta_utc.strftime('%m/%d %H:%M'))
-        with col3:
-            tz_label = f"UTC{'+' if arrival_tz >= 0 else ''}{arrival_tz}"
             st.metric(f"ETA ({tz_label})", eta_arr_local.strftime('%m/%d %H:%M'))
-        with col4:
+        with col3:
             st.metric("Voyage Time", f"{voyage_time:.1f} hrs")
-        
-        col5, col6, col7, col8 = st.columns(4)
-        with col5:
+        with col4:
             st.metric("Avg Speed", f"{avg_speed:.1f} kt")
         
-        # 테이블 표시
+        # 테이블 표시 (HTML with rotated arrows)
         st.subheader("Detailed Forecast")
-        results_df = create_results_table(final_dr, departure_tz, arrival_tz)
-        st.dataframe(results_df, use_container_width=True)
-        
-        # CSV 다운로드
-        csv = results_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv,
-            file_name=f"weather_routing_{departure_datetime.strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv"
-        )
+        table_html = create_results_table_html(final_dr)
+        st.markdown(table_html, unsafe_allow_html=True)
         
     except Exception as e:
         st.error(f"❌ Error: {str(e)}")
