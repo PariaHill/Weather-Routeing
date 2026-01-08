@@ -809,10 +809,32 @@ def create_route_map(track_points: List[Tuple[float, float]], dr_positions: List
         tooltip='Planned Route'
     ).add_to(m)
     
-    # DR 항로 라인 (예상 항로) - 파란색 실선, 애니메이션
-    dr_coords = [[p['lat'], p['lon']] for p in dr_positions]
+    # DR 항로 라인 - 트랙을 따라가도록 구성
+    # DR 위치들 사이의 트랙 구간을 포함하여 라인 생성
+    track_line = TrackLine(track_points)
+    dr_route_coords = []
+    
+    for i, dr_point in enumerate(dr_positions):
+        dr_distance = dr_point['distance_sailed']
+        
+        if i == 0:
+            # 첫 DR 위치
+            dr_route_coords.append([dr_point['lat'], dr_point['lon']])
+        else:
+            prev_distance = dr_positions[i-1]['distance_sailed']
+            
+            # 이전 DR과 현재 DR 사이의 트랙 경유점들 추가
+            for j, cum_dist in enumerate(track_line.cumulative_distances):
+                if prev_distance < cum_dist < dr_distance:
+                    # 이 경유점은 두 DR 사이에 있음
+                    dr_route_coords.append([track_points[j][0], track_points[j][1]])
+            
+            # 현재 DR 위치 추가
+            dr_route_coords.append([dr_point['lat'], dr_point['lon']])
+    
+    # DR 항로 애니메이션 라인
     AntPath(
-        dr_coords,
+        dr_route_coords,
         weight=4,
         color='#2E86AB',
         pulse_color='#A5D8FF',
@@ -822,6 +844,7 @@ def create_route_map(track_points: List[Tuple[float, float]], dr_positions: List
     
     # DR 위치 마커
     for i, point in enumerate(dr_positions):
+        weather = point.get('weather')
         weather = point.get('weather')
         
         # 팝업 내용 생성
