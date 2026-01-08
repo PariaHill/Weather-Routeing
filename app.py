@@ -6,16 +6,22 @@ import math
 import pandas as pd
 from typing import List, Tuple, Dict
 import json
-from streamlit_local_storage import LocalStorage
 
-# Page config
+# Page config - must be first Streamlit command
 st.set_page_config(page_title="Weather Routing Calculator", layout="wide")
 
-# Initialize localStorage
-local_storage = LocalStorage()
+# Initialize localStorage (after set_page_config)
+try:
+    from streamlit_local_storage import LocalStorage
+    local_storage = LocalStorage()
+    LOCAL_STORAGE_AVAILABLE = True
+except:
+    LOCAL_STORAGE_AVAILABLE = False
 
 def load_from_storage(key: str, default):
     """localStorage에서 값 로드"""
+    if not LOCAL_STORAGE_AVAILABLE:
+        return default
     try:
         value = local_storage.getItem(key)
         if value is not None:
@@ -26,8 +32,10 @@ def load_from_storage(key: str, default):
 
 def save_to_storage(key: str, value):
     """localStorage에 값 저장"""
+    if not LOCAL_STORAGE_AVAILABLE:
+        return
     try:
-        local_storage.setItem(key, value)
+        local_storage.setItem(key, value, key=f"save_{key}")
     except:
         pass
 
