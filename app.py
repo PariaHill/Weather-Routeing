@@ -649,18 +649,24 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
         lat_str = decimal_to_dms(point['lat'], is_lat=True)
         lon_str = decimal_to_dms(point['lon'], is_lat=False)
         
-        # Course (heading) with arrow
+        # Course (heading) - 화살표 없이 숫자만
         heading = point.get('heading')
         if heading is not None:
-            course_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({heading}deg);">↓</span>'
-            course_str = f'{course_arrow} {heading:.0f}°'
+            course_str = f"{heading:.0f}°"
         else:
             course_str = "N/A"
         
-        # Pressure
-        pressure = f"{weather.pressure:.1f}" if weather and weather.pressure else "N/A"
+        # Pressure (Pa -> hPa 변환, 소수점 없이)
+        if weather and weather.pressure:
+            # 100000 이상이면 Pa 단위이므로 hPa로 변환
+            pressure_val = weather.pressure
+            if pressure_val > 10000:
+                pressure_val = pressure_val / 100
+            pressure = f"{pressure_val:.0f}"
+        else:
+            pressure = "N/A"
         
-        # Wind with arrow (가는 방향으로 표시하려면 +180도)
+        # Wind with arrow (바람이 가는 방향 = 오는 방향 + 180)
         if weather and weather.wind_dir is not None and weather.wind_speed is not None:
             arrow_deg = (weather.wind_dir + 180) % 360
             wind_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({arrow_deg}deg);">↓</span>'
@@ -668,7 +674,7 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
         else:
             wind_str = "N/A"
         
-        # Wave with arrow (가는 방향으로 표시하려면 +180도)
+        # Wave with arrow (파도가 가는 방향 = 오는 방향 + 180)
         if weather and weather.wave_dir is not None and weather.wave_height is not None:
             arrow_deg = (weather.wave_dir + 180) % 360
             wave_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({arrow_deg}deg);">↓</span>'
