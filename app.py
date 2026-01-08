@@ -217,7 +217,7 @@ def get_windy_weather(lat: float, lon: float, api_key: str) -> Dict:
             "lat": lat,
             "lon": lon,
             "model": "gfsWave",
-            "parameters": ["waves", "swell1"],
+            "parameters": ["waves", "swell1", "swell2"],
             "levels": ["surface"],
             "key": api_key
         }
@@ -231,6 +231,9 @@ def get_windy_weather(lat: float, lon: float, api_key: str) -> Dict:
         if wave_response.status_code == 200:
             wave_data = wave_response.json()
             weather_data['wave'] = wave_data
+        else:
+            # 디버그: 응답 상태 확인
+            weather_data['wave_error'] = f"Status: {wave_response.status_code}"
     except Exception as e:
         st.warning(f"Wave data fetch failed: {e}")
     
@@ -276,30 +279,44 @@ def parse_windy_data(weather_data: Dict, target_time: datetime) -> WeatherPoint:
         wave = weather_data['wave']
         timestamps = wave.get('ts', [])
         
-        target_ts = int(target_time.timestamp() * 1000)
-        closest_idx = 0
-        min_diff = abs(timestamps[0] - target_ts)
-        
-        for i, ts in enumerate(timestamps):
-            diff = abs(ts - target_ts)
-            if diff < min_diff:
-                min_diff = diff
-                closest_idx = i
-        
-        # Wave 데이터
-        if 'waves-surface' in wave:
-            waves = wave['waves-surface'][closest_idx]
-            result.wave_height = waves
-        
-        if 'wavesDirection-surface' in wave:
-            result.wave_dir = wave['wavesDirection-surface'][closest_idx]
-        
-        # Swell 데이터
-        if 'swell1-surface' in wave:
-            result.swell_height = wave['swell1-surface'][closest_idx]
-        
-        if 'swell1Direction-surface' in wave:
-            result.swell_dir = wave['swell1Direction-surface'][closest_idx]
+        if timestamps:
+            target_ts = int(target_time.timestamp() * 1000)
+            closest_idx = 0
+            min_diff = abs(timestamps[0] - target_ts)
+            
+            for i, ts in enumerate(timestamps):
+                diff = abs(ts - target_ts)
+                if diff < min_diff:
+                    min_diff = diff
+                    closest_idx = i
+            
+            # Wave 높이 - 여러 가능한 키 시도
+            wave_height_keys = ['waves_height-surface', 'waves-surface', 'wavesHeight-surface']
+            for key in wave_height_keys:
+                if key in wave:
+                    result.wave_height = wave[key][closest_idx]
+                    break
+            
+            # Wave 방향
+            wave_dir_keys = ['waves_direction-surface', 'wavesDirection-surface', 'waves_dir-surface']
+            for key in wave_dir_keys:
+                if key in wave:
+                    result.wave_dir = wave[key][closest_idx]
+                    break
+            
+            # Swell 높이
+            swell_height_keys = ['swell1_height-surface', 'swell1-surface', 'swellHeight-surface']
+            for key in swell_height_keys:
+                if key in wave:
+                    result.swell_height = wave[key][closest_idx]
+                    break
+            
+            # Swell 방향
+            swell_dir_keys = ['swell1_direction-surface', 'swell1Direction-surface', 'swell1_dir-surface']
+            for key in swell_dir_keys:
+                if key in wave:
+                    result.swell_dir = wave[key][closest_idx]
+                    break
     
     return result
 
@@ -562,17 +579,21 @@ with st.sidebar:
     except:
         api_key = ""
         st.error("❌ WINDY_API_KEY not found in secrets")
+    
+    st.markdown("---")
+    st.header("Debug Options")
+    show_debug = st.checkbox("Show API response keys", value=False)
 
-# Main area
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    st.header("Upload GPX Track")
-    gpx_file = st.file_uploader("Choose a GPX file", type=['gpx'])
-
-with col2:
-    st.header("Actions")
-    calculate_button = st.button("🧭 Calculate Route", type="primary", use_container_width=True)
+# Main area - Expander로 접을 수 있게
+with st.expander("📁 Upload GPX Track & Actions", expanded=True):
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        gpx_file = st.file_uploader("Choose a GPX file", type=['gpx'])
+    
+    with col2:
+        st.markdown("<br>", unsafe_allow_html=True)  # 간격 조정
+        calculate_button = st.button("🧭 Calculate Route", type="primary", use_container_width=True)
 
 if calculate_button and gpx_file and api_key:
     try:
@@ -608,6 +629,18 @@ if calculate_button and gpx_file and api_key:
         # 첫번째 반복: 기상 데이터로 DR 재계산
         st.info("🌤️ Fetching weather data and recalculating DR...")
         updated_dr = recalculate_dr_with_weather(initial_dr, vessel, track_points, api_key)
+        
+        # 디버그: API 응답 키 확인
+        if show_debug and updated_dr and 'weather' in updated_dr[1]:
+            # 첫 번째 기상 데이터 포인트에서 원본 데이터 확인을 위해 다시 조회
+            test_weather = get_windy_weather(updated_dr[1]['lat'], updated_dr[1]['lon'], api_key)
+            with st.expander("🔍 Debug: API Response Keys", expanded=False):
+                if 'gfs' in test_weather:
+                    st.write("**GFS Keys:**", list(test_weather['gfs'].keys()))
+                if 'wave' in test_weather:
+                    st.write("**Wave Keys:**", list(test_weather['wave'].keys()))
+                if 'wave_error' in test_weather:
+                    st.write("**Wave Error:**", test_weather['wave_error'])
         
         # 두번째 반복: 업데이트된 위치에서 기상 재조회
         st.info("🔄 Refining with updated positions...")
