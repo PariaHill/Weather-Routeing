@@ -489,14 +489,31 @@ def calculate_speed_loss(vessel: VesselData, weather: WeatherPoint,
 def recalculate_dr_with_weather(initial_dr: List[Dict], vessel: VesselData,
                                 track_points: List[Tuple[float, float]],
                                 api_key: str) -> List[Dict]:
-    """기상 데이터를 반영하여 DR 재계산"""
+    """기상 데이터를 반영하여 DR 재계산 - 트랙을 따라 이동"""
     updated_dr = []
     
+    # 트랙의 각 세그먼트 거리와 누적 거리 계산
+    segment_distances = []
+    cumulative_distances = [0]
+    for i in range(len(track_points) - 1):
+        dist = calculate_distance(track_points[i][0], track_points[i][1],
+                                 track_points[i+1][0], track_points[i+1][1])
+        segment_distances.append(dist)
+        cumulative_distances.append(cumulative_distances[-1] + dist)
+    
+    total_track_distance = cumulative_distances[-1]
+    
     # 첫 포인트는 그대로
-    updated_dr.append(initial_dr[0].copy())
+    first_point = initial_dr[0].copy()
+    first_point['heading'] = calculate_bearing(track_points[0][0], track_points[0][1],
+                                                track_points[1][0], track_points[1][1])
+    updated_dr.append(first_point)
     
     progress_bar = st.progress(0)
     status_text = st.empty()
+    
+    # 현재까지 항해한 트랙 상의 거리
+    current_track_distance = 0
     
     for i in range(1, len(initial_dr)):
         status_text.text(f"Fetching weather data: {i}/{len(initial_dr)-1}")
@@ -505,57 +522,79 @@ def recalculate_dr_with_weather(initial_dr: List[Dict], vessel: VesselData,
         prev_point = updated_dr[-1]
         current_point = initial_dr[i]
         
-        # 기상 데이터 조회
+        # 현재 위치에서 기상 데이터 조회
         weather_data = get_windy_weather(prev_point['lat'], prev_point['lon'], api_key)
         weather = parse_windy_data(weather_data, prev_point['time'])
         
-        # 현재 DR 위치에서 목적지 방향으로 heading 계산
-        # track_points에서 현재 위치보다 앞에 있는 가장 가까운 경유점 찾기
-        current_lat, current_lon = prev_point['lat'], prev_point['lon']
-        
-        # 가장 가까운 다음 경유점 찾기
-        target_idx = len(track_points) - 1  # 기본값: 최종 목적지
-        for idx in range(len(track_points) - 1):
-            # 현재 위치에서 각 경유점까지 거리 확인
-            dist_to_waypoint = calculate_distance(current_lat, current_lon,
-                                                  track_points[idx + 1][0], track_points[idx + 1][1])
-            if dist_to_waypoint > 1:  # 1해리 이상 떨어져 있으면 이 경유점을 목표로
-                target_idx = idx + 1
+        # 현재 세그먼트의 heading 찾기
+        current_segment_idx = 0
+        for j in range(len(cumulative_distances) - 1):
+            if current_track_distance < cumulative_distances[j + 1]:
+                current_segment_idx = j
                 break
+        else:
+            current_segment_idx = len(track_points) - 2
         
-        vessel_heading = calculate_bearing(current_lat, current_lon,
-                                          track_points[target_idx][0], track_points[target_idx][1])
+        vessel_heading = calculate_bearing(track_points[current_segment_idx][0], 
+                                          track_points[current_segment_idx][1],
+                                          track_points[current_segment_idx + 1][0], 
+                                          track_points[current_segment_idx + 1][1])
         
         # 속력 손실 계산
         speed_loss = calculate_speed_loss(vessel, weather, vessel_heading)
         actual_speed = max(vessel.speed_knots - speed_loss, 3)  # 최소 3노트
         
-        # 실제 항해 거리
+        # 이 시간 동안 항해할 거리
         time_interval = (current_point['time'] - prev_point['time']).total_seconds() / 3600
-        distance = actual_speed * time_interval
+        distance_to_sail = actual_speed * time_interval
         
-        # 새 위치 계산
-        new_lat, new_lon = rhumb_line_destination(prev_point['lat'], prev_point['lon'],
-                                                   vessel_heading, distance)
+        # 트랙을 따라 이동
+        new_track_distance = current_track_distance + distance_to_sail
         
-        # 누적 거리 계산
-        distance_sailed = prev_point['distance_sailed'] + distance
+        if new_track_distance >= total_track_distance:
+            # 목적지 도달
+            new_lat, new_lon = track_points[-1]
+            new_track_distance = total_track_distance
+            vessel_heading = calculate_bearing(track_points[-2][0], track_points[-2][1],
+                                              track_points[-1][0], track_points[-1][1])
+        else:
+            # 트랙 상의 위치 찾기
+            for j in range(len(cumulative_distances) - 1):
+                if new_track_distance < cumulative_distances[j + 1]:
+                    # 이 세그먼트 안에 위치
+                    segment_start_dist = cumulative_distances[j]
+                    distance_in_segment = new_track_distance - segment_start_dist
+                    
+                    vessel_heading = calculate_bearing(track_points[j][0], track_points[j][1],
+                                                      track_points[j + 1][0], track_points[j + 1][1])
+                    
+                    new_lat, new_lon = rhumb_line_destination(
+                        track_points[j][0], track_points[j][1],
+                        vessel_heading, distance_in_segment
+                    )
+                    break
+            else:
+                # 마지막 지점
+                new_lat, new_lon = track_points[-1]
         
-        # 남은 거리는 목적지까지 직선거리로 재계산
-        distance_remaining = calculate_distance(new_lat, new_lon,
-                                               track_points[-1][0], track_points[-1][1])
+        current_track_distance = new_track_distance
+        distance_sailed = current_track_distance
+        distance_remaining = total_track_distance - current_track_distance
         
         updated_dr.append({
             'time': current_point['time'],
             'lat': new_lat,
             'lon': new_lon,
             'distance_sailed': distance_sailed,
-            'distance_remaining': distance_remaining,
+            'distance_remaining': max(0, distance_remaining),
             'weather': weather,
             'heading': vessel_heading,
             'actual_speed': actual_speed,
             'speed_loss': speed_loss
         })
+        
+        if current_track_distance >= total_track_distance:
+            break
     
     progress_bar.empty()
     status_text.empty()
