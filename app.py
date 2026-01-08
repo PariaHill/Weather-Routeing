@@ -521,15 +521,23 @@ def ms_to_knots(ms: float) -> float:
     """m/s를 노트로 변환"""
     return ms * 1.94384
 
-def create_results_table(dr_positions: List[Dict]) -> pd.DataFrame:
+def create_results_table(dr_positions: List[Dict], dep_tz: int = 0, arr_tz: int = 0) -> pd.DataFrame:
     """결과 테이블 생성"""
     rows = []
     
     for point in dr_positions:
         weather = point.get('weather')
         
+        # UTC 시간
+        utc_time = point['time']
+        # 출발지/도착지 로컬 시간
+        dep_local = utc_time + timedelta(hours=dep_tz)
+        arr_local = utc_time + timedelta(hours=arr_tz)
+        
         row = {
-            'Time (UTC)': point['time'].strftime('%Y-%m-%d %H:%M'),
+            'Time (UTC)': utc_time.strftime('%Y-%m-%d %H:%M'),
+            'Dep LT': dep_local.strftime('%m-%d %H:%M'),
+            'Arr LT': arr_local.strftime('%m-%d %H:%M'),
             'Latitude': f"{point['lat']:.4f}",
             'Longitude': f"{point['lon']:.4f}",
             'Pressure (hPa)': f"{weather.pressure:.1f}" if weather and weather.pressure else "N/A",
@@ -539,8 +547,7 @@ def create_results_table(dr_positions: List[Dict]) -> pd.DataFrame:
             'Wave Height (m)': f"{weather.wave_height:.1f}" if weather and weather.wave_height else "N/A",
             'Distance Sailed (nm)': f"{point['distance_sailed']:.1f}",
             'Distance Remaining (nm)': f"{point['distance_remaining']:.1f}",
-            'Actual Speed (kt)': f"{point.get('actual_speed', 0):.1f}" if 'actual_speed' in point else "N/A",
-            'Speed Loss (kt)': f"{point.get('speed_loss', 0):.1f}" if 'speed_loss' in point else "N/A"
+            'Est. Speed (kt)': f"{point.get('actual_speed', 0):.1f}" if 'actual_speed' in point else "N/A"
         }
         
         rows.append(row)
@@ -566,10 +573,27 @@ with st.sidebar:
     st.header("Voyage Data")
     
     speed_knots = st.number_input("Speed through water (knots)", min_value=1.0, value=11.0, step=0.5)
-    departure_date = st.date_input("Departure Date", datetime.now().date())
-    departure_time = st.time_input("Departure Time (UTC)", datetime.now().time())
     
-    departure_datetime = datetime.combine(departure_date, departure_time)
+    # Time Zone 옵션 생성 (-12 ~ +13)
+    tz_options = [f"UTC{'+' if i >= 0 else ''}{i}" for i in range(-12, 14)]
+    tz_values = list(range(-12, 14))
+    
+    col_dep, col_arr = st.columns(2)
+    with col_dep:
+        dep_tz_idx = st.selectbox("Departure Zone", options=range(len(tz_options)), 
+                                   format_func=lambda x: tz_options[x], index=12)  # UTC+0 기본값
+        departure_tz = tz_values[dep_tz_idx]
+    with col_arr:
+        arr_tz_idx = st.selectbox("Arrival Zone", options=range(len(tz_options)), 
+                                   format_func=lambda x: tz_options[x], index=21)  # UTC+9 기본값 (한국)
+        arrival_tz = tz_values[arr_tz_idx]
+    
+    departure_date = st.date_input("Departure Date (LT)", datetime.now().date())
+    departure_time = st.time_input("Departure Time (LT)", datetime.now().time())
+    
+    # 로컬 시간을 UTC로 변환
+    departure_local = datetime.combine(departure_date, departure_time)
+    departure_datetime = departure_local - timedelta(hours=departure_tz)
     
     st.markdown("---")
     # Windy API 키는 Streamlit secrets에서만 읽음
@@ -608,67 +632,79 @@ if calculate_button and gpx_file and api_key:
             speed_knots=speed_knots
         )
         
-        st.info("📍 Parsing GPX track...")
-        track_points = parse_gpx(gpx_file)
+        # 계산 과정을 expander 안에 표시
+        progress_expander = st.expander("⚙️ Calculation Progress", expanded=True)
         
-        if len(track_points) == 0:
-            st.error("❌ No track points found in GPX file. Please check the file contains tracks, routes, or waypoints.")
-            st.stop()
+        with progress_expander:
+            st.info("📍 Parsing GPX track...")
+            track_points = parse_gpx(gpx_file)
+            
+            if len(track_points) == 0:
+                st.error("❌ No track points found in GPX file. Please check the file contains tracks, routes, or waypoints.")
+                st.stop()
+            
+            if len(track_points) < 2:
+                st.error("❌ At least 2 points are required for routing.")
+                st.stop()
+            
+            st.success(f"✅ Loaded {len(track_points)} track points")
+            
+            # 초기 DR 계산
+            st.info("🧮 Calculating initial DR positions...")
+            initial_dr = calculate_initial_dr_positions(track_points, departure_datetime, speed_knots)
+            st.success(f"✅ Generated {len(initial_dr)} DR positions")
+            
+            # 첫번째 반복: 기상 데이터로 DR 재계산
+            st.info("🌤️ Fetching weather data and recalculating DR...")
+            updated_dr = recalculate_dr_with_weather(initial_dr, vessel, track_points, api_key)
+            
+            # 디버그: API 응답 키 확인
+            if show_debug and updated_dr and len(updated_dr) > 1 and 'weather' in updated_dr[1]:
+                # 첫 번째 기상 데이터 포인트에서 원본 데이터 확인을 위해 다시 조회
+                test_weather = get_windy_weather(updated_dr[1]['lat'], updated_dr[1]['lon'], api_key)
+                with st.expander("🔍 Debug: API Response Keys", expanded=False):
+                    if 'gfs' in test_weather:
+                        st.write("**GFS Keys:**", list(test_weather['gfs'].keys()))
+                    if 'wave' in test_weather:
+                        st.write("**Wave Keys:**", list(test_weather['wave'].keys()))
+                    if 'wave_error' in test_weather:
+                        st.write("**Wave Error:**", test_weather['wave_error'])
+            
+            # 두번째 반복: 업데이트된 위치에서 기상 재조회
+            st.info("🔄 Refining with updated positions...")
+            final_dr = refine_dr_with_updated_positions(updated_dr, vessel, api_key)
+            
+            # 결과 표시
+            st.success("✅ Weather routing calculation completed!")
         
-        if len(track_points) < 2:
-            st.error("❌ At least 2 points are required for routing.")
-            st.stop()
-        
-        st.success(f"✅ Loaded {len(track_points)} track points")
-        
-        # 초기 DR 계산
-        st.info("🧮 Calculating initial DR positions...")
-        initial_dr = calculate_initial_dr_positions(track_points, departure_datetime, speed_knots)
-        st.success(f"✅ Generated {len(initial_dr)} DR positions")
-        
-        # 첫번째 반복: 기상 데이터로 DR 재계산
-        st.info("🌤️ Fetching weather data and recalculating DR...")
-        updated_dr = recalculate_dr_with_weather(initial_dr, vessel, track_points, api_key)
-        
-        # 디버그: API 응답 키 확인
-        if show_debug and updated_dr and 'weather' in updated_dr[1]:
-            # 첫 번째 기상 데이터 포인트에서 원본 데이터 확인을 위해 다시 조회
-            test_weather = get_windy_weather(updated_dr[1]['lat'], updated_dr[1]['lon'], api_key)
-            with st.expander("🔍 Debug: API Response Keys", expanded=False):
-                if 'gfs' in test_weather:
-                    st.write("**GFS Keys:**", list(test_weather['gfs'].keys()))
-                if 'wave' in test_weather:
-                    st.write("**Wave Keys:**", list(test_weather['wave'].keys()))
-                if 'wave_error' in test_weather:
-                    st.write("**Wave Error:**", test_weather['wave_error'])
-        
-        # 두번째 반복: 업데이트된 위치에서 기상 재조회
-        st.info("🔄 Refining with updated positions...")
-        final_dr = refine_dr_with_updated_positions(updated_dr, vessel, api_key)
-        
-        # 결과 표시
-        st.success("✅ Weather routing calculation completed!")
         st.markdown("---")
         
         st.header("📊 Routing Results")
         
         # 요약 정보
+        eta_utc = final_dr[-1]['time']
+        eta_arr_local = eta_utc + timedelta(hours=arrival_tz)
+        voyage_time = (eta_utc - departure_datetime).total_seconds() / 3600
+        avg_speed = final_dr[-1]['distance_sailed'] / voyage_time if voyage_time > 0 else 0
+        
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Total Distance", f"{final_dr[-1]['distance_sailed']:.1f} nm")
         with col2:
-            eta = final_dr[-1]['time']
-            st.metric("ETA (UTC)", eta.strftime('%m/%d %H:%M'))
+            st.metric("ETA (UTC)", eta_utc.strftime('%m/%d %H:%M'))
         with col3:
-            voyage_time = (eta - departure_datetime).total_seconds() / 3600
-            st.metric("Voyage Time", f"{voyage_time:.1f} hrs")
+            tz_label = f"UTC{'+' if arrival_tz >= 0 else ''}{arrival_tz}"
+            st.metric(f"ETA ({tz_label})", eta_arr_local.strftime('%m/%d %H:%M'))
         with col4:
-            avg_speed = final_dr[-1]['distance_sailed'] / voyage_time
+            st.metric("Voyage Time", f"{voyage_time:.1f} hrs")
+        
+        col5, col6, col7, col8 = st.columns(4)
+        with col5:
             st.metric("Avg Speed", f"{avg_speed:.1f} kt")
         
         # 테이블 표시
         st.subheader("Detailed Forecast")
-        results_df = create_results_table(final_dr)
+        results_df = create_results_table(final_dr, departure_tz, arrival_tz)
         st.dataframe(results_df, use_container_width=True)
         
         # CSV 다운로드
