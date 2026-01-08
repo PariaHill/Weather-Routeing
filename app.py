@@ -139,89 +139,191 @@ def rhumb_line_destination(lat, lon, bearing, distance) -> Tuple[float, float]:
     
     return lat2, lon2
 
-def calculate_initial_dr_positions(track_points: List[Tuple[float, float]], 
-                                   start_time: datetime, 
-                                   speed_knots: float,
-                                   interval_hours: int = 6) -> List[Dict]:
-    """초기 DR 위치 계산 (6시간 간격)"""
+class TrackLine:
+    """트랙 라인을 따라 위치를 계산하는 헬퍼 클래스"""
+    
+    def __init__(self, track_points: List[Tuple[float, float]]):
+        self.track_points = track_points
+        self.segment_distances = []
+        self.cumulative_distances = [0]
+        
+        # 각 세그먼트 거리와 누적 거리 계산
+        for i in range(len(track_points) - 1):
+            dist = calculate_distance(track_points[i][0], track_points[i][1],
+                                     track_points[i+1][0], track_points[i+1][1])
+            self.segment_distances.append(dist)
+            self.cumulative_distances.append(self.cumulative_distances[-1] + dist)
+        
+        self.total_distance = self.cumulative_distances[-1]
+    
+    def get_position_at_distance(self, distance: float) -> Tuple[float, float, float]:
+        """
+        트랙 상의 주어진 거리에서의 위치와 heading 반환
+        Returns: (lat, lon, heading)
+        """
+        if distance <= 0:
+            heading = calculate_bearing(self.track_points[0][0], self.track_points[0][1],
+                                       self.track_points[1][0], self.track_points[1][1])
+            return self.track_points[0][0], self.track_points[0][1], heading
+        
+        if distance >= self.total_distance:
+            heading = calculate_bearing(self.track_points[-2][0], self.track_points[-2][1],
+                                       self.track_points[-1][0], self.track_points[-1][1])
+            return self.track_points[-1][0], self.track_points[-1][1], heading
+        
+        # 해당 거리가 속한 세그먼트 찾기
+        for i in range(len(self.cumulative_distances) - 1):
+            if distance <= self.cumulative_distances[i + 1]:
+                # 이 세그먼트 안에 위치
+                segment_start_dist = self.cumulative_distances[i]
+                distance_in_segment = distance - segment_start_dist
+                
+                heading = calculate_bearing(self.track_points[i][0], self.track_points[i][1],
+                                           self.track_points[i + 1][0], self.track_points[i + 1][1])
+                
+                lat, lon = rhumb_line_destination(
+                    self.track_points[i][0], self.track_points[i][1],
+                    heading, distance_in_segment
+                )
+                return lat, lon, heading
+        
+        # fallback
+        heading = calculate_bearing(self.track_points[-2][0], self.track_points[-2][1],
+                                   self.track_points[-1][0], self.track_points[-1][1])
+        return self.track_points[-1][0], self.track_points[-1][1], heading
+
+def calculate_dr_on_track(track: TrackLine, start_time: datetime, 
+                          speed_knots: float, interval_hours: int = 6) -> List[Dict]:
+    """
+    Step 1 & 2: 정해진 속도로 트랙을 따라 DR 위치 계산
+    """
     dr_positions = []
-    
-    # 전체 항로의 총 거리와 bearing 계산
-    total_distance = 0
-    for i in range(len(track_points) - 1):
-        dist = calculate_distance(track_points[i][0], track_points[i][1],
-                                 track_points[i+1][0], track_points[i+1][1])
-        total_distance += dist
-    
-    # 시작점 heading (첫 번째 경유점 방향)
-    initial_heading = calculate_bearing(track_points[0][0], track_points[0][1],
-                                        track_points[1][0], track_points[1][1])
-    
-    # 시작점
     current_time = start_time
-    current_lat, current_lon = track_points[0]
+    distance_sailed = 0
+    
+    # 출발점
+    lat, lon, heading = track.get_position_at_distance(0)
     dr_positions.append({
         'time': current_time,
-        'lat': current_lat,
-        'lon': current_lon,
+        'lat': lat,
+        'lon': lon,
         'distance_sailed': 0,
-        'distance_remaining': total_distance,
-        'heading': initial_heading
+        'distance_remaining': track.total_distance,
+        'heading': heading
     })
     
-    # 6시간 간격으로 DR 계산
-    distance_sailed = 0
-    track_idx = 0
-    
-    while distance_sailed < total_distance:
+    # 6시간 간격으로 위치 계산
+    while distance_sailed < track.total_distance:
         current_time += timedelta(hours=interval_hours)
-        distance_to_sail = speed_knots * interval_hours
-        distance_sailed += distance_to_sail
+        distance_sailed += speed_knots * interval_hours
         
-        if distance_sailed >= total_distance:
-            # 목적지 도달
-            current_lat, current_lon = track_points[-1]
-            distance_remaining = 0
-            # 마지막 heading은 이전 구간의 방향 유지
-            heading = calculate_bearing(track_points[-2][0], track_points[-2][1],
-                                       track_points[-1][0], track_points[-1][1])
-        else:
-            # 현재 구간에서 위치 찾기
-            accumulated_dist = 0
-            heading = initial_heading
-            for i in range(track_idx, len(track_points) - 1):
-                seg_dist = calculate_distance(track_points[i][0], track_points[i][1],
-                                             track_points[i+1][0], track_points[i+1][1])
-                
-                if accumulated_dist + seg_dist >= distance_to_sail:
-                    # 이 구간에 위치
-                    remaining_in_seg = distance_to_sail - accumulated_dist
-                    bearing = calculate_bearing(track_points[i][0], track_points[i][1],
-                                              track_points[i+1][0], track_points[i+1][1])
-                    heading = bearing
-                    current_lat, current_lon = rhumb_line_destination(
-                        track_points[i][0], track_points[i][1], bearing, remaining_in_seg
-                    )
-                    track_idx = i
-                    break
-                
-                accumulated_dist += seg_dist
-            
-            distance_remaining = total_distance - distance_sailed
+        if distance_sailed >= track.total_distance:
+            distance_sailed = track.total_distance
+        
+        lat, lon, heading = track.get_position_at_distance(distance_sailed)
         
         dr_positions.append({
             'time': current_time,
-            'lat': current_lat,
-            'lon': current_lon,
+            'lat': lat,
+            'lon': lon,
             'distance_sailed': distance_sailed,
-            'distance_remaining': distance_remaining,
+            'distance_remaining': track.total_distance - distance_sailed,
             'heading': heading
         })
         
-        if distance_sailed >= total_distance:
+        if distance_sailed >= track.total_distance:
             break
     
     return dr_positions
+
+def fetch_weather_for_positions(dr_positions: List[Dict], api_key: str) -> List[Dict]:
+    """
+    Step 3 & 5: DR 위치들의 기상 데이터 조회
+    """
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, point in enumerate(dr_positions):
+        status_text.text(f"Fetching weather data: {i+1}/{len(dr_positions)}")
+        progress_bar.progress((i + 1) / len(dr_positions))
+        
+        weather_data = get_windy_weather(point['lat'], point['lon'], api_key)
+        weather = parse_windy_data(weather_data, point['time'])
+        point['weather'] = weather
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    return dr_positions
+
+def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
+                                vessel: VesselData, start_time: datetime,
+                                interval_hours: int = 6) -> List[Dict]:
+    """
+    Step 4: 기상 영향을 반영하여 DR 재계산 (트랙 라인 위에서만)
+    """
+    new_dr = []
+    current_time = start_time
+    distance_sailed = 0
+    
+    # 출발점 (기상 데이터 복사)
+    lat, lon, heading = track.get_position_at_distance(0)
+    new_dr.append({
+        'time': current_time,
+        'lat': lat,
+        'lon': lon,
+        'distance_sailed': 0,
+        'distance_remaining': track.total_distance,
+        'heading': heading,
+        'weather': dr_positions[0].get('weather'),
+        'actual_speed': vessel.speed_knots,
+        'speed_loss': 0
+    })
+    
+    # 각 구간별로 속도 계산하여 위치 재계산
+    for i in range(1, len(dr_positions)):
+        prev_point = new_dr[-1]
+        orig_point = dr_positions[i]
+        
+        # 이전 위치의 기상 데이터로 속도 손실 계산
+        weather = prev_point.get('weather')
+        if weather:
+            speed_loss = calculate_speed_loss(vessel, weather, prev_point['heading'])
+        else:
+            speed_loss = 0
+        
+        actual_speed = max(vessel.speed_knots - speed_loss, 3)  # 최소 3노트
+        
+        # 이 구간 동안 항해한 거리
+        distance_this_interval = actual_speed * interval_hours
+        distance_sailed += distance_this_interval
+        
+        # 트랙 끝을 넘어가면 조정
+        if distance_sailed >= track.total_distance:
+            distance_sailed = track.total_distance
+        
+        # 트랙 상의 새 위치
+        lat, lon, heading = track.get_position_at_distance(distance_sailed)
+        
+        # 시간도 재계산 (실제 속도 기반)
+        current_time += timedelta(hours=interval_hours)
+        
+        new_dr.append({
+            'time': current_time,
+            'lat': lat,
+            'lon': lon,
+            'distance_sailed': distance_sailed,
+            'distance_remaining': track.total_distance - distance_sailed,
+            'heading': heading,
+            'weather': orig_point.get('weather'),  # 기존 기상 데이터 임시 사용
+            'actual_speed': actual_speed,
+            'speed_loss': speed_loss
+        })
+        
+        if distance_sailed >= track.total_distance:
+            break
+    
+    return new_dr
 
 def get_windy_weather(lat: float, lon: float, api_key: str) -> Dict:
     """Windy API로 기상 데이터 조회"""
@@ -485,149 +587,6 @@ def calculate_speed_loss(vessel: VesselData, weather: WeatherPoint,
     speed_loss = max(0, min(speed_loss, max_loss))
     
     return speed_loss
-
-def recalculate_dr_with_weather(initial_dr: List[Dict], vessel: VesselData,
-                                track_points: List[Tuple[float, float]],
-                                api_key: str) -> List[Dict]:
-    """기상 데이터를 반영하여 DR 재계산 - 트랙을 따라 이동"""
-    updated_dr = []
-    
-    # 트랙의 각 세그먼트 거리와 누적 거리 계산
-    segment_distances = []
-    cumulative_distances = [0]
-    for i in range(len(track_points) - 1):
-        dist = calculate_distance(track_points[i][0], track_points[i][1],
-                                 track_points[i+1][0], track_points[i+1][1])
-        segment_distances.append(dist)
-        cumulative_distances.append(cumulative_distances[-1] + dist)
-    
-    total_track_distance = cumulative_distances[-1]
-    
-    # 첫 포인트는 그대로
-    first_point = initial_dr[0].copy()
-    first_point['heading'] = calculate_bearing(track_points[0][0], track_points[0][1],
-                                                track_points[1][0], track_points[1][1])
-    updated_dr.append(first_point)
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # 현재까지 항해한 트랙 상의 거리
-    current_track_distance = 0
-    
-    for i in range(1, len(initial_dr)):
-        status_text.text(f"Fetching weather data: {i}/{len(initial_dr)-1}")
-        progress_bar.progress(i / (len(initial_dr) - 1))
-        
-        prev_point = updated_dr[-1]
-        current_point = initial_dr[i]
-        
-        # 현재 위치에서 기상 데이터 조회
-        weather_data = get_windy_weather(prev_point['lat'], prev_point['lon'], api_key)
-        weather = parse_windy_data(weather_data, prev_point['time'])
-        
-        # 현재 세그먼트의 heading 찾기
-        current_segment_idx = 0
-        for j in range(len(cumulative_distances) - 1):
-            if current_track_distance < cumulative_distances[j + 1]:
-                current_segment_idx = j
-                break
-        else:
-            current_segment_idx = len(track_points) - 2
-        
-        vessel_heading = calculate_bearing(track_points[current_segment_idx][0], 
-                                          track_points[current_segment_idx][1],
-                                          track_points[current_segment_idx + 1][0], 
-                                          track_points[current_segment_idx + 1][1])
-        
-        # 속력 손실 계산
-        speed_loss = calculate_speed_loss(vessel, weather, vessel_heading)
-        actual_speed = max(vessel.speed_knots - speed_loss, 3)  # 최소 3노트
-        
-        # 이 시간 동안 항해할 거리
-        time_interval = (current_point['time'] - prev_point['time']).total_seconds() / 3600
-        distance_to_sail = actual_speed * time_interval
-        
-        # 트랙을 따라 이동
-        new_track_distance = current_track_distance + distance_to_sail
-        
-        if new_track_distance >= total_track_distance:
-            # 목적지 도달
-            new_lat, new_lon = track_points[-1]
-            new_track_distance = total_track_distance
-            vessel_heading = calculate_bearing(track_points[-2][0], track_points[-2][1],
-                                              track_points[-1][0], track_points[-1][1])
-        else:
-            # 트랙 상의 위치 찾기
-            for j in range(len(cumulative_distances) - 1):
-                if new_track_distance < cumulative_distances[j + 1]:
-                    # 이 세그먼트 안에 위치
-                    segment_start_dist = cumulative_distances[j]
-                    distance_in_segment = new_track_distance - segment_start_dist
-                    
-                    vessel_heading = calculate_bearing(track_points[j][0], track_points[j][1],
-                                                      track_points[j + 1][0], track_points[j + 1][1])
-                    
-                    new_lat, new_lon = rhumb_line_destination(
-                        track_points[j][0], track_points[j][1],
-                        vessel_heading, distance_in_segment
-                    )
-                    break
-            else:
-                # 마지막 지점
-                new_lat, new_lon = track_points[-1]
-        
-        current_track_distance = new_track_distance
-        distance_sailed = current_track_distance
-        distance_remaining = total_track_distance - current_track_distance
-        
-        updated_dr.append({
-            'time': current_point['time'],
-            'lat': new_lat,
-            'lon': new_lon,
-            'distance_sailed': distance_sailed,
-            'distance_remaining': max(0, distance_remaining),
-            'weather': weather,
-            'heading': vessel_heading,
-            'actual_speed': actual_speed,
-            'speed_loss': speed_loss
-        })
-        
-        if current_track_distance >= total_track_distance:
-            break
-    
-    progress_bar.empty()
-    status_text.empty()
-    
-    return updated_dr
-
-def refine_dr_with_updated_positions(dr_positions: List[Dict], vessel: VesselData,
-                                     api_key: str) -> List[Dict]:
-    """업데이트된 DR 위치로 기상 재조회"""
-    refined_dr = []
-    refined_dr.append(dr_positions[0].copy())
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i in range(1, len(dr_positions)):
-        status_text.text(f"Refining weather data: {i}/{len(dr_positions)-1}")
-        progress_bar.progress(i / (len(dr_positions) - 1))
-        
-        point = dr_positions[i]
-        
-        # 새 위치에서 기상 재조회
-        weather_data = get_windy_weather(point['lat'], point['lon'], api_key)
-        weather = parse_windy_data(weather_data, point['time'])
-        
-        refined_point = point.copy()
-        refined_point['weather'] = weather
-        refined_dr.append(refined_point)
-    
-    progress_bar.empty()
-    status_text.empty()
-    
-    return refined_dr
 
 def ms_to_knots(ms: float) -> float:
     """m/s를 노트로 변환"""
@@ -1077,19 +1036,22 @@ if calculate_button and gpx_file and api_key:
             
             st.success(f"✅ Loaded {len(track_points)} track points")
             
-            # 초기 DR 계산
+            # TrackLine 객체 생성
+            track = TrackLine(track_points)
+            st.info(f"📏 Total track distance: {track.total_distance:.1f} nm")
+            
+            # Step 1 & 2: 초기 DR 위치 계산 (정속 기준)
             st.info("🧮 Calculating initial DR positions...")
-            initial_dr = calculate_initial_dr_positions(track_points, departure_datetime, speed_knots)
+            initial_dr = calculate_dr_on_track(track, departure_datetime, speed_knots)
             st.success(f"✅ Generated {len(initial_dr)} DR positions")
             
-            # 첫번째 반복: 기상 데이터로 DR 재계산
-            st.info("🌤️ Fetching weather data and recalculating DR...")
-            updated_dr = recalculate_dr_with_weather(initial_dr, vessel, track_points, api_key)
+            # Step 3: 초기 DR 위치들의 기상 데이터 조회
+            st.info("🌤️ Fetching weather data for initial positions...")
+            initial_dr = fetch_weather_for_positions(initial_dr, api_key)
             
             # 디버그: API 응답 키 확인
-            if show_debug and updated_dr and len(updated_dr) > 1 and 'weather' in updated_dr[1]:
-                # 첫 번째 기상 데이터 포인트에서 원본 데이터 확인을 위해 다시 조회
-                test_weather = get_windy_weather(updated_dr[1]['lat'], updated_dr[1]['lon'], api_key)
+            if show_debug and initial_dr and len(initial_dr) > 1 and 'weather' in initial_dr[1]:
+                test_weather = get_windy_weather(initial_dr[1]['lat'], initial_dr[1]['lon'], api_key)
                 with st.expander("🔍 Debug: API Response Keys", expanded=False):
                     if 'gfs' in test_weather:
                         st.write("**GFS Keys:**", list(test_weather['gfs'].keys()))
@@ -1098,9 +1060,13 @@ if calculate_button and gpx_file and api_key:
                     if 'wave_error' in test_weather:
                         st.write("**Wave Error:**", test_weather['wave_error'])
             
-            # 두번째 반복: 업데이트된 위치에서 기상 재조회
-            st.info("🔄 Refining with updated positions...")
-            final_dr = refine_dr_with_updated_positions(updated_dr, vessel, api_key)
+            # Step 4: 기상 영향 반영하여 DR 재계산
+            st.info("🔄 Recalculating DR with weather effects...")
+            updated_dr = recalculate_dr_with_weather(initial_dr, track, vessel, departure_datetime)
+            
+            # Step 5: 재계산된 위치의 기상 데이터 다시 조회
+            st.info("🌤️ Fetching weather data for updated positions...")
+            final_dr = fetch_weather_for_positions(updated_dr, api_key)
             
             # 결과 표시
             st.success("✅ Weather routing calculation completed!")
