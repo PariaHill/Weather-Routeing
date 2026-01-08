@@ -43,13 +43,27 @@ class WeatherPoint:
         self.swell_height = swell_height  # m
 
 def parse_gpx(gpx_file) -> List[Tuple[float, float]]:
-    """GPX 파일에서 트랙 포인트 추출"""
+    """GPX 파일에서 포인트 추출 (트랙, 루트, 웨이포인트 모두 지원)"""
     gpx = gpxpy.parse(gpx_file)
     points = []
+    
+    # 1. 트랙 포인트 (tracks > segments > points)
     for track in gpx.tracks:
         for segment in track.segments:
             for point in segment.points:
                 points.append((point.latitude, point.longitude))
+    
+    # 2. 트랙이 없으면 루트 포인트 시도 (routes > points)
+    if not points:
+        for route in gpx.routes:
+            for point in route.points:
+                points.append((point.latitude, point.longitude))
+    
+    # 3. 루트도 없으면 웨이포인트 시도
+    if not points:
+        for waypoint in gpx.waypoints:
+            points.append((waypoint.latitude, waypoint.longitude))
+    
     return points
 
 def calculate_distance(lat1, lon1, lat2, lon2) -> float:
@@ -564,6 +578,15 @@ if calculate_button and gpx_file and api_key:
         
         st.info("📍 Parsing GPX track...")
         track_points = parse_gpx(gpx_file)
+        
+        if len(track_points) == 0:
+            st.error("❌ No track points found in GPX file. Please check the file contains tracks, routes, or waypoints.")
+            st.stop()
+        
+        if len(track_points) < 2:
+            st.error("❌ At least 2 points are required for routing.")
+            st.stop()
+        
         st.success(f"✅ Loaded {len(track_points)} track points")
         
         # 초기 DR 계산
