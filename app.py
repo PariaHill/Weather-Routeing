@@ -6,9 +6,30 @@ import math
 import pandas as pd
 from typing import List, Tuple, Dict
 import json
+from streamlit_local_storage import LocalStorage
 
 # Page config
 st.set_page_config(page_title="Weather Routing Calculator", layout="wide")
+
+# Initialize localStorage
+local_storage = LocalStorage()
+
+def load_from_storage(key: str, default):
+    """localStorage에서 값 로드"""
+    try:
+        value = local_storage.getItem(key)
+        if value is not None:
+            return value
+    except:
+        pass
+    return default
+
+def save_to_storage(key: str, value):
+    """localStorage에 값 저장"""
+    try:
+        local_storage.setItem(key, value)
+    except:
+        pass
 
 class VesselData:
     """선박 제원 데이터"""
@@ -666,18 +687,16 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
         else:
             pressure = "N/A"
         
-        # Wind with arrow (바람이 가는 방향 = 오는 방향 + 180)
+        # Wind with arrow (오는 방향 그대로 표시)
         if weather and weather.wind_dir is not None and weather.wind_speed is not None:
-            arrow_deg = (weather.wind_dir + 180) % 360
-            wind_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({arrow_deg}deg);">↓</span>'
+            wind_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wind_dir}deg);">↓</span>'
             wind_str = f'{wind_arrow} {weather.wind_dir:.0f}° / {ms_to_knots(weather.wind_speed):.1f}kt'
         else:
             wind_str = "N/A"
         
-        # Wave with arrow (파도가 가는 방향 = 오는 방향 + 180)
+        # Wave with arrow (오는 방향 그대로 표시)
         if weather and weather.wave_dir is not None and weather.wave_height is not None:
-            arrow_deg = (weather.wave_dir + 180) % 360
-            wave_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({arrow_deg}deg);">↓</span>'
+            wave_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wave_dir}deg);">↓</span>'
             wave_str = f'{wave_arrow} {weather.wave_dir:.0f}° / {weather.wave_height:.1f}m'
         else:
             wave_str = "N/A"
@@ -734,18 +753,18 @@ def create_results_table(dr_positions: List[Dict]) -> pd.DataFrame:
     
     return pd.DataFrame(rows)
 
-# Initialize session state for persistent values
+# Initialize session state with localStorage values
 if 'initialized' not in st.session_state:
     st.session_state.initialized = True
-    st.session_state.displacement = 5000.0
-    st.session_state.windage_front = 500.0
-    st.session_state.windage_side = 800.0
-    st.session_state.loa = 115.0
-    st.session_state.breadth = 20.0
-    st.session_state.draft = 5.5
-    st.session_state.speed_knots = 11.0
-    st.session_state.dep_tz_idx = 12  # UTC+0
-    st.session_state.arr_tz_idx = 21  # UTC+9
+    st.session_state.displacement = load_from_storage('displacement', 5000.0)
+    st.session_state.windage_front = load_from_storage('windage_front', 500.0)
+    st.session_state.windage_side = load_from_storage('windage_side', 800.0)
+    st.session_state.loa = load_from_storage('loa', 115.0)
+    st.session_state.breadth = load_from_storage('breadth', 20.0)
+    st.session_state.draft = load_from_storage('draft', 5.5)
+    st.session_state.speed_knots = load_from_storage('speed_knots', 11.0)
+    st.session_state.dep_tz_idx = load_from_storage('dep_tz_idx', 12)  # UTC+0
+    st.session_state.arr_tz_idx = load_from_storage('arr_tz_idx', 21)  # UTC+9
     st.session_state.calculation_done = False
 
 # Streamlit UI
@@ -757,42 +776,56 @@ with st.sidebar:
     st.header("Vessel Data")
     
     displacement = st.number_input("Displacement (ton)", min_value=100.0, 
-                                   value=st.session_state.displacement, step=100.0,
+                                   value=float(st.session_state.displacement), step=100.0,
                                    key="input_displacement")
-    st.session_state.displacement = displacement
+    if displacement != st.session_state.displacement:
+        st.session_state.displacement = displacement
+        save_to_storage('displacement', displacement)
     
     windage_front = st.number_input("Windage Area Front (m²)", min_value=10.0, 
-                                    value=st.session_state.windage_front, step=10.0,
+                                    value=float(st.session_state.windage_front), step=10.0,
                                     key="input_windage_front")
-    st.session_state.windage_front = windage_front
+    if windage_front != st.session_state.windage_front:
+        st.session_state.windage_front = windage_front
+        save_to_storage('windage_front', windage_front)
     
     windage_side = st.number_input("Windage Area Side (m²)", min_value=10.0, 
-                                   value=st.session_state.windage_side, step=10.0,
+                                   value=float(st.session_state.windage_side), step=10.0,
                                    key="input_windage_side")
-    st.session_state.windage_side = windage_side
+    if windage_side != st.session_state.windage_side:
+        st.session_state.windage_side = windage_side
+        save_to_storage('windage_side', windage_side)
     
     loa = st.number_input("LOA (m)", min_value=10.0, 
-                          value=st.session_state.loa, step=1.0,
+                          value=float(st.session_state.loa), step=1.0,
                           key="input_loa")
-    st.session_state.loa = loa
+    if loa != st.session_state.loa:
+        st.session_state.loa = loa
+        save_to_storage('loa', loa)
     
     breadth = st.number_input("Breadth (m)", min_value=5.0, 
-                              value=st.session_state.breadth, step=0.5,
+                              value=float(st.session_state.breadth), step=0.5,
                               key="input_breadth")
-    st.session_state.breadth = breadth
+    if breadth != st.session_state.breadth:
+        st.session_state.breadth = breadth
+        save_to_storage('breadth', breadth)
     
     draft = st.number_input("Draft (m)", min_value=1.0, 
-                            value=st.session_state.draft, step=0.1,
+                            value=float(st.session_state.draft), step=0.1,
                             key="input_draft")
-    st.session_state.draft = draft
+    if draft != st.session_state.draft:
+        st.session_state.draft = draft
+        save_to_storage('draft', draft)
     
     st.markdown("---")
     st.header("Voyage Data")
     
     speed_knots = st.number_input("Speed through water (knots)", min_value=1.0, 
-                                  value=st.session_state.speed_knots, step=0.5,
+                                  value=float(st.session_state.speed_knots), step=0.5,
                                   key="input_speed")
-    st.session_state.speed_knots = speed_knots
+    if speed_knots != st.session_state.speed_knots:
+        st.session_state.speed_knots = speed_knots
+        save_to_storage('speed_knots', speed_knots)
     
     # Time Zone 옵션 생성 (-12 ~ +13)
     tz_options = [f"UTC{'+' if i >= 0 else ''}{i}" for i in range(-12, 14)]
@@ -802,16 +835,20 @@ with st.sidebar:
     with col_dep:
         dep_tz_idx = st.selectbox("Departure Zone", options=range(len(tz_options)), 
                                    format_func=lambda x: tz_options[x], 
-                                   index=st.session_state.dep_tz_idx,
+                                   index=int(st.session_state.dep_tz_idx),
                                    key="input_dep_tz")
-        st.session_state.dep_tz_idx = dep_tz_idx
+        if dep_tz_idx != st.session_state.dep_tz_idx:
+            st.session_state.dep_tz_idx = dep_tz_idx
+            save_to_storage('dep_tz_idx', dep_tz_idx)
         departure_tz = tz_values[dep_tz_idx]
     with col_arr:
         arr_tz_idx = st.selectbox("Arrival Zone", options=range(len(tz_options)), 
                                    format_func=lambda x: tz_options[x], 
-                                   index=st.session_state.arr_tz_idx,
+                                   index=int(st.session_state.arr_tz_idx),
                                    key="input_arr_tz")
-        st.session_state.arr_tz_idx = arr_tz_idx
+        if arr_tz_idx != st.session_state.arr_tz_idx:
+            st.session_state.arr_tz_idx = arr_tz_idx
+            save_to_storage('arr_tz_idx', arr_tz_idx)
         arrival_tz = tz_values[arr_tz_idx]
     
     departure_date = st.date_input("Departure Date (LT)", datetime.now().date())
