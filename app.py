@@ -6,14 +6,6 @@ import math
 import pandas as pd
 from typing import List, Tuple, Dict
 import json
-from streamlit_local_storage import LocalStorage
-ls = LocalStorage()
-
-# 저장
-ls.setItem("vessel_displacement", displacement)
-
-# 불러오기
-saved_value = ls.getItem("vessel_displacement")
 
 # Page config
 st.set_page_config(page_title="Weather Routing Calculator", layout="wide")
