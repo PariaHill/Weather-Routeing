@@ -419,11 +419,22 @@ def recalculate_dr_with_weather(initial_dr: List[Dict], vessel: VesselData,
         weather_data = get_windy_weather(prev_point['lat'], prev_point['lon'], api_key)
         weather = parse_windy_data(weather_data, prev_point['time'])
         
-        # 다음 포인트로의 방위각
-        next_idx = min(i, len(track_points) - 1)
-        prev_idx = max(i - 1, 0)
-        vessel_heading = calculate_bearing(track_points[prev_idx][0], track_points[prev_idx][1],
-                                          track_points[next_idx][0], track_points[next_idx][1])
+        # 현재 DR 위치에서 목적지 방향으로 heading 계산
+        # track_points에서 현재 위치보다 앞에 있는 가장 가까운 경유점 찾기
+        current_lat, current_lon = prev_point['lat'], prev_point['lon']
+        
+        # 가장 가까운 다음 경유점 찾기
+        target_idx = len(track_points) - 1  # 기본값: 최종 목적지
+        for idx in range(len(track_points) - 1):
+            # 현재 위치에서 각 경유점까지 거리 확인
+            dist_to_waypoint = calculate_distance(current_lat, current_lon,
+                                                  track_points[idx + 1][0], track_points[idx + 1][1])
+            if dist_to_waypoint > 1:  # 1해리 이상 떨어져 있으면 이 경유점을 목표로
+                target_idx = idx + 1
+                break
+        
+        vessel_heading = calculate_bearing(current_lat, current_lon,
+                                          track_points[target_idx][0], track_points[target_idx][1])
         
         # 속력 손실 계산
         speed_loss = calculate_speed_loss(vessel, weather, vessel_heading)
