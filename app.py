@@ -158,14 +158,16 @@ class TrackLine:
     
     def get_position_at_distance(self, distance: float) -> Tuple[float, float, float]:
         """
-        트랙 상의 주어진 거리에서의 위치와 heading 반환
+        트랙 상의 주어진 거리에서의 위치와 heading 반환 (선형 보간 사용)
         Returns: (lat, lon, heading)
         """
+        # 출발점
         if distance <= 0:
             heading = calculate_bearing(self.track_points[0][0], self.track_points[0][1],
                                        self.track_points[1][0], self.track_points[1][1])
             return self.track_points[0][0], self.track_points[0][1], heading
         
+        # 도착점
         if distance >= self.total_distance:
             heading = calculate_bearing(self.track_points[-2][0], self.track_points[-2][1],
                                        self.track_points[-1][0], self.track_points[-1][1])
@@ -173,21 +175,34 @@ class TrackLine:
         
         # 해당 거리가 속한 세그먼트 찾기
         for i in range(len(self.cumulative_distances) - 1):
-            if distance <= self.cumulative_distances[i + 1]:
+            seg_start_dist = self.cumulative_distances[i]
+            seg_end_dist = self.cumulative_distances[i + 1]
+            
+            if distance <= seg_end_dist:
                 # 이 세그먼트 안에 위치
-                segment_start_dist = self.cumulative_distances[i]
-                distance_in_segment = distance - segment_start_dist
+                segment_length = self.segment_distances[i]
+                distance_in_segment = distance - seg_start_dist
                 
-                heading = calculate_bearing(self.track_points[i][0], self.track_points[i][1],
-                                           self.track_points[i + 1][0], self.track_points[i + 1][1])
+                # 선형 보간 비율 (0.0 ~ 1.0)
+                if segment_length > 0:
+                    ratio = distance_in_segment / segment_length
+                else:
+                    ratio = 0
                 
-                lat, lon = rhumb_line_destination(
-                    self.track_points[i][0], self.track_points[i][1],
-                    heading, distance_in_segment
-                )
+                # 시작점과 끝점
+                start_lat, start_lon = self.track_points[i]
+                end_lat, end_lon = self.track_points[i + 1]
+                
+                # 선형 보간으로 위치 계산 (정확히 트랙 위)
+                lat = start_lat + ratio * (end_lat - start_lat)
+                lon = start_lon + ratio * (end_lon - start_lon)
+                
+                # Heading
+                heading = calculate_bearing(start_lat, start_lon, end_lat, end_lon)
+                
                 return lat, lon, heading
         
-        # fallback
+        # fallback (도착점)
         heading = calculate_bearing(self.track_points[-2][0], self.track_points[-2][1],
                                    self.track_points[-1][0], self.track_points[-1][1])
         return self.track_points[-1][0], self.track_points[-1][1], heading
