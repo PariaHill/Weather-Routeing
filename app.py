@@ -530,11 +530,13 @@ with st.sidebar:
     departure_datetime = datetime.combine(departure_date, departure_time)
     
     st.markdown("---")
-    api_key = st.text_input("Windy API Key", type="password", 
-                           help="Enter your Windy API key or use Streamlit secrets")
-    
-    if not api_key:
-        api_key = st.secrets.get("WINDY_API_KEY", "")
+    # Windy API 키는 Streamlit secrets에서만 읽음
+    try:
+        api_key = st.secrets["WINDY_API_KEY"]
+        st.success("✅ API Key loaded")
+    except:
+        api_key = ""
+        st.error("❌ WINDY_API_KEY not found in secrets")
 
 # Main area
 col1, col2 = st.columns([2, 1])
