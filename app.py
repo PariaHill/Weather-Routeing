@@ -42,17 +42,80 @@ def save_to_storage(key: str, value):
     except:
         pass
 
+# 선종별 경험적 파라미터
+VESSEL_TYPE_PARAMS = {
+    'Bulk Carrier': {
+        'windage_front_ratio': 0.08,   # 정면 풍압면적 / (LOA * Depth)
+        'windage_side_ratio': 0.35,    # 측면 풍압면적 / (LOA * Depth)
+        'typical_cb': 0.85,            # 일반적인 방형비척계수
+        'wave_resistance_factor': 1.0  # 파랑저항 계수
+    },
+    'Tanker': {
+        'windage_front_ratio': 0.06,
+        'windage_side_ratio': 0.30,
+        'typical_cb': 0.82,
+        'wave_resistance_factor': 0.95
+    },
+    'Container': {
+        'windage_front_ratio': 0.12,
+        'windage_side_ratio': 0.50,
+        'typical_cb': 0.65,
+        'wave_resistance_factor': 1.1
+    },
+    'Special Purpose': {
+        'windage_front_ratio': 0.15,   # Cable layer, Survey vessel 등
+        'windage_side_ratio': 0.55,
+        'typical_cb': 0.70,
+        'wave_resistance_factor': 1.15
+    },
+    'RoRo': {
+        'windage_front_ratio': 0.18,
+        'windage_side_ratio': 0.60,
+        'typical_cb': 0.60,
+        'wave_resistance_factor': 1.2
+    },
+    'General Cargo': {
+        'windage_front_ratio': 0.10,
+        'windage_side_ratio': 0.40,
+        'typical_cb': 0.75,
+        'wave_resistance_factor': 1.05
+    }
+}
+
 class VesselData:
     """선박 제원 데이터"""
-    def __init__(self, displacement, windage_area_front, windage_area_side, 
+    def __init__(self, vessel_type, displacement, windage_area_side, 
                  loa, breadth, draft, speed_knots):
+        self.vessel_type = vessel_type
         self.displacement = displacement  # 톤
-        self.windage_area_front = windage_area_front  # m²
-        self.windage_area_side = windage_area_side  # m²
         self.loa = loa  # m
         self.breadth = breadth  # m
         self.draft = draft  # m
         self.speed_knots = speed_knots  # 노트
+        
+        # 선종별 파라미터 가져오기
+        params = VESSEL_TYPE_PARAMS.get(vessel_type, VESSEL_TYPE_PARAMS['General Cargo'])
+        self.wave_resistance_factor = params['wave_resistance_factor']
+        
+        # Depth 추정 (Draft의 약 1.5~2배)
+        estimated_depth = draft * 1.8
+        
+        # 풍압면적 계산 (선종별 경험적 비율 사용)
+        self.windage_area_front = params['windage_front_ratio'] * loa * estimated_depth
+        self.windage_area_side = windage_area_side  # 측면은 사용자 입력 유지
+        
+        # 방형비척계수(Cb) 계산: Cb = Displacement / (L × B × d × ρ)
+        # ρ = 1.025 (표준해수 비중)
+        seawater_density = 1.025  # ton/m³
+        underwater_volume = loa * breadth * draft  # m³ (이론적 최대 부피)
+        calculated_cb = displacement / (underwater_volume * seawater_density)
+        
+        # Cb가 현실적인 범위(0.4~0.95)인지 확인
+        if 0.4 <= calculated_cb <= 0.95:
+            self.cb = calculated_cb
+        else:
+            # 비현실적인 값이면 선종별 기본값 사용
+            self.cb = params['typical_cb']
 
 class WeatherPoint:
     """기상 데이터 포인트"""
@@ -220,7 +283,7 @@ class TrackLine:
         return self.track_points[-1][0], self.track_points[-1][1], heading
 
 def calculate_dr_on_track(track: TrackLine, start_time: datetime, 
-                          speed_knots: float, interval_hours: int = 6) -> List[Dict]:
+                          speed_knots: float, interval_hours: int) -> List[Dict]:
     """
     Step 1 & 2: 정해진 속도로 트랙을 따라 DR 위치 계산
     """
@@ -239,7 +302,7 @@ def calculate_dr_on_track(track: TrackLine, start_time: datetime,
         'heading': heading
     })
     
-    # 6시간 간격으로 위치 계산
+    # interval_hours 간격으로 위치 계산
     while distance_sailed < track.total_distance:
         current_time += timedelta(hours=interval_hours)
         distance_sailed += speed_knots * interval_hours
@@ -263,20 +326,35 @@ def calculate_dr_on_track(track: TrackLine, start_time: datetime,
     
     return dr_positions
 
-def fetch_weather_for_positions(dr_positions: List[Dict], api_key: str) -> List[Dict]:
+def fetch_weather_for_positions(dr_positions: List[Dict], api_key: str, 
+                                 start_time: datetime) -> List[Dict]:
     """
     Step 3 & 5: DR 위치들의 기상 데이터 조회
+    Windy API는 약 10일(240시간) 예보만 제공하므로, 그 이후는 NIL 처리
     """
     progress_bar = st.progress(0)
     status_text = st.empty()
+    
+    # Windy API 예보 한계 (약 10일 = 240시간)
+    FORECAST_LIMIT_HOURS = 240
     
     for i, point in enumerate(dr_positions):
         status_text.text(f"Fetching weather data: {i+1}/{len(dr_positions)}")
         progress_bar.progress((i + 1) / len(dr_positions))
         
-        weather_data = get_windy_weather(point['lat'], point['lon'], api_key)
-        weather = parse_windy_data(weather_data, point['time'])
-        point['weather'] = weather
+        # 출발 시간 대비 경과 시간 계산
+        hours_from_start = (point['time'] - start_time).total_seconds() / 3600
+        
+        if hours_from_start <= FORECAST_LIMIT_HOURS:
+            # 예보 범위 내: API 조회
+            weather_data = get_windy_weather(point['lat'], point['lon'], api_key)
+            weather = parse_windy_data(weather_data, point['time'])
+            point['weather'] = weather
+            point['weather_available'] = True
+        else:
+            # 예보 범위 초과: NIL 처리
+            point['weather'] = WeatherPoint(point['time'], point['lat'], point['lon'])
+            point['weather_available'] = False
     
     progress_bar.empty()
     status_text.empty()
@@ -285,10 +363,11 @@ def fetch_weather_for_positions(dr_positions: List[Dict], api_key: str) -> List[
 
 def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
                                 vessel: VesselData, start_time: datetime,
-                                interval_hours: int = 6) -> List[Dict]:
+                                interval_hours: int) -> List[Dict]:
     """
     Step 4: 기상 영향을 반영하여 DR 재계산 (트랙 라인 위에서만)
     마지막에 정확한 도착점과 ETA 추가
+    기상 데이터가 없는 구간(weather_available=False)은 대수속력으로 계산
     """
     new_dr = []
     current_time = start_time
@@ -304,6 +383,7 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
         'distance_remaining': track.total_distance,
         'heading': heading,
         'weather': dr_positions[0].get('weather'),
+        'weather_available': dr_positions[0].get('weather_available', True),
         'actual_speed': vessel.speed_knots,
         'speed_loss': 0
     })
@@ -313,11 +393,15 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
         prev_point = new_dr[-1]
         orig_point = dr_positions[i]
         
-        # 이전 위치의 기상 데이터로 속도 손실 계산
+        # 기상 데이터 가용 여부 확인
+        weather_available = prev_point.get('weather_available', True)
         weather = prev_point.get('weather')
-        if weather:
+        
+        if weather_available and weather:
+            # 기상 데이터 있음: 속도 손실 계산
             speed_loss = calculate_speed_loss(vessel, weather, prev_point['heading'])
         else:
+            # 기상 데이터 없음: 대수속력 사용 (손실 0)
             speed_loss = 0
         
         actual_speed = max(vessel.speed_knots - speed_loss, 3)  # 최소 3노트
@@ -344,6 +428,7 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
                 'distance_remaining': 0,
                 'heading': heading,
                 'weather': orig_point.get('weather'),
+                'weather_available': orig_point.get('weather_available', True),
                 'actual_speed': actual_speed,
                 'speed_loss': speed_loss
             })
@@ -363,6 +448,7 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
             'distance_remaining': track.total_distance - distance_sailed,
             'heading': heading,
             'weather': orig_point.get('weather'),
+            'weather_available': orig_point.get('weather_available', True),
             'actual_speed': actual_speed,
             'speed_loss': speed_loss
         })
@@ -371,8 +457,10 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
     last_point = new_dr[-1]
     if last_point['distance_remaining'] > 0.1:  # 0.1nm 이상 남았으면
         # 마지막 구간의 속도로 도착 시간 계산
+        weather_available = last_point.get('weather_available', True)
         weather = last_point.get('weather')
-        if weather:
+        
+        if weather_available and weather:
             speed_loss = calculate_speed_loss(vessel, weather, last_point['heading'])
         else:
             speed_loss = 0
@@ -390,6 +478,7 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
             'distance_remaining': 0,
             'heading': heading,
             'weather': last_point.get('weather'),
+            'weather_available': last_point.get('weather_available', True),
             'actual_speed': actual_speed,
             'speed_loss': speed_loss
         })
@@ -577,7 +666,7 @@ def calculate_wind_resistance(vessel: VesselData, wind_speed_ms: float,
 
 def calculate_wave_resistance(vessel: VesselData, wave_height: float, 
                               wave_dir: float, vessel_heading: float) -> float:
-    """파랑저항 계산 (kN) - 간략화된 Kwon 방법"""
+    """파랑저항 계산 (kN) - 간략화된 Kwon 방법, 선종별 계수 적용"""
     if wave_height < 0.5:
         return 0
     
@@ -611,7 +700,11 @@ def calculate_wave_resistance(vessel: VesselData, wave_height: float,
     else:
         height_factor = wave_height * 1.5
     
-    R_wave = C * B * (height_factor ** 1.5) * direction_factor
+    # 선종별 파랑저항 계수 적용 (Cb도 반영 - 비대선일수록 저항 증가)
+    cb_factor = 0.7 + (vessel.cb * 0.5)  # Cb 0.6 → 1.0, Cb 0.85 → 1.125
+    type_factor = getattr(vessel, 'wave_resistance_factor', 1.0)
+    
+    R_wave = C * B * (height_factor ** 1.5) * direction_factor * cb_factor * type_factor
     
     return R_wave  # kN
 
@@ -692,8 +785,10 @@ def create_arrow_svg(degrees: float, size: int = 16) -> str:
     </svg>'''
     return svg
 
-def create_results_table_html(dr_positions: List[Dict]) -> str:
-    """결과 테이블을 HTML로 생성 (SVG 화살표 포함)"""
+def create_results_table_html(dr_positions: List[Dict], speed_knots: float = None) -> str:
+    """결과 테이블을 HTML로 생성 (SVG 화살표 포함)
+    기상 데이터가 없는 구간(weather_available=False)은 NIL로 표시
+    """
     
     html = '''
     <style>
@@ -716,6 +811,16 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
         }
         .weather-table tr:hover {
             background-color: #f8f9fa;
+        }
+        .weather-table tr.no-weather {
+            background-color: #fff8e6;
+        }
+        .weather-table tr.no-weather:hover {
+            background-color: #fff3cd;
+        }
+        .nil-cell {
+            color: #999;
+            font-style: italic;
         }
         .arrow-cell {
             display: inline-flex;
@@ -748,9 +853,14 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
     
     for i, point in enumerate(dr_positions):
         weather = point.get('weather')
+        weather_available = point.get('weather_available', True)
         utc_time = point['time'].strftime('%Y-%m-%d %H:%M')
         lat_str = decimal_to_dms(point['lat'], is_lat=True)
         lon_str = decimal_to_dms(point['lon'], is_lat=False)
+        
+        # 기상 데이터 없는 행 스타일
+        row_class = '' if weather_available else 'no-weather'
+        nil_class = '' if weather_available else 'nil-cell'
         
         # Course (heading) - 화살표 없이 숫자만
         heading = point.get('heading')
@@ -759,40 +869,53 @@ def create_results_table_html(dr_positions: List[Dict]) -> str:
         else:
             course_str = "N/A"
         
-        # Pressure (Pa -> hPa 변환, 소수점 없이)
-        if weather and weather.pressure:
-            # 100000 이상이면 Pa 단위이므로 hPa로 변환
-            pressure_val = weather.pressure
-            if pressure_val > 10000:
-                pressure_val = pressure_val / 100
-            pressure = f"{pressure_val:.0f}"
+        if not weather_available:
+            # 기상 데이터 없음: NIL 표시
+            pressure = f'<span class="{nil_class}">NIL</span>'
+            wind_str = f'<span class="{nil_class}">NIL</span>'
+            wave_str = f'<span class="{nil_class}">NIL</span>'
+            max_wave_str = f'<span class="{nil_class}">NIL</span>'
+            # Est. Speed는 대수속력 사용
+            if speed_knots:
+                est_speed = f"{speed_knots:.1f}"
+            else:
+                est_speed = f"{point.get('actual_speed', 0):.1f}" if 'actual_speed' in point else "N/A"
         else:
-            pressure = "N/A"
-        
-        # Wind with arrow (오는 방향 그대로 표시)
-        if weather and weather.wind_dir is not None and weather.wind_speed is not None:
-            wind_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wind_dir}deg);">↓</span>'
-            wind_str = f'{wind_arrow} {weather.wind_dir:.0f}° / {ms_to_knots(weather.wind_speed):.1f}kt'
-        else:
-            wind_str = "N/A"
-        
-        # Wave with arrow (오는 방향 그대로 표시)
-        if weather and weather.wave_dir is not None and weather.wave_height is not None:
-            wave_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wave_dir}deg);">↓</span>'
-            wave_str = f'{wave_arrow} {weather.wave_dir:.0f}° / {weather.wave_height:.1f}m'
-            # Max Wave (레일리 분포 x1.6)
-            max_wave = weather.wave_height * 1.6
-            max_wave_str = f"{max_wave:.1f}m"
-        else:
-            wave_str = "N/A"
-            max_wave_str = "N/A"
+            # Pressure (Pa -> hPa 변환, 소수점 없이)
+            if weather and weather.pressure:
+                # 100000 이상이면 Pa 단위이므로 hPa로 변환
+                pressure_val = weather.pressure
+                if pressure_val > 10000:
+                    pressure_val = pressure_val / 100
+                pressure = f"{pressure_val:.0f}"
+            else:
+                pressure = "N/A"
+            
+            # Wind with arrow (오는 방향 그대로 표시)
+            if weather and weather.wind_dir is not None and weather.wind_speed is not None:
+                wind_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wind_dir}deg);">↓</span>'
+                wind_str = f'{wind_arrow} {weather.wind_dir:.0f}° / {ms_to_knots(weather.wind_speed):.1f}kt'
+            else:
+                wind_str = "N/A"
+            
+            # Wave with arrow (오는 방향 그대로 표시)
+            if weather and weather.wave_dir is not None and weather.wave_height is not None:
+                wave_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({weather.wave_dir}deg);">↓</span>'
+                wave_str = f'{wave_arrow} {weather.wave_dir:.0f}° / {weather.wave_height:.1f}m'
+                # Max Wave (레일리 분포 x1.6)
+                max_wave = weather.wave_height * 1.6
+                max_wave_str = f"{max_wave:.1f}m"
+            else:
+                wave_str = "N/A"
+                max_wave_str = "N/A"
+            
+            est_speed = f"{point.get('actual_speed', 0):.1f}" if 'actual_speed' in point else "N/A"
         
         sailed = f"{point['distance_sailed']:.1f}"
         remaining = f"{point['distance_remaining']:.1f}"
-        est_speed = f"{point.get('actual_speed', 0):.1f}" if 'actual_speed' in point else "N/A"
         
         html += f'''
-            <tr>
+            <tr class="{row_class}">
                 <td>{utc_time}</td>
                 <td>{lat_str}</td>
                 <td>{lon_str}</td>
@@ -998,13 +1121,14 @@ def create_route_map(track_points: List[Tuple[float, float]], dr_positions: List
 # Initialize session state with localStorage values
 if 'initialized' not in st.session_state:
     st.session_state.initialized = True
+    st.session_state.vessel_type_idx = load_from_storage('vessel_type_idx', 3)  # Special Purpose (기본값)
     st.session_state.displacement = load_from_storage('displacement', 5000.0)
-    st.session_state.windage_front = load_from_storage('windage_front', 500.0)
     st.session_state.windage_side = load_from_storage('windage_side', 800.0)
     st.session_state.loa = load_from_storage('loa', 115.0)
     st.session_state.breadth = load_from_storage('breadth', 20.0)
     st.session_state.draft = load_from_storage('draft', 5.5)
     st.session_state.speed_knots = load_from_storage('speed_knots', 11.0)
+    st.session_state.interval_idx = load_from_storage('interval_idx', 1)  # 6시간 (기본값)
     st.session_state.dep_tz_idx = load_from_storage('dep_tz_idx', 12)  # UTC+0
     st.session_state.arr_tz_idx = load_from_storage('arr_tz_idx', 21)  # UTC+9
     st.session_state.calculation_done = False
@@ -1016,9 +1140,25 @@ if 'initialized' not in st.session_state:
 st.title("⛵ Weather Routing Calculator")
 st.markdown("---")
 
+# 선종 옵션 리스트
+VESSEL_TYPES = list(VESSEL_TYPE_PARAMS.keys())
+
+# Interval 옵션
+INTERVAL_OPTIONS = [3, 6, 12, 24]
+
 # Sidebar - 선박 데이터 입력
 with st.sidebar:
     st.header("Vessel Data")
+    
+    # 선종 선택 (맨 위에 추가)
+    vessel_type_idx = st.selectbox("Vessel Type", options=range(len(VESSEL_TYPES)),
+                                    format_func=lambda x: VESSEL_TYPES[x],
+                                    index=int(st.session_state.vessel_type_idx),
+                                    key="input_vessel_type")
+    if vessel_type_idx != st.session_state.vessel_type_idx:
+        st.session_state.vessel_type_idx = vessel_type_idx
+        save_to_storage('vessel_type_idx', vessel_type_idx)
+    vessel_type = VESSEL_TYPES[vessel_type_idx]
     
     displacement = st.number_input("Displacement (ton)", min_value=100.0, 
                                    value=float(st.session_state.displacement), step=100.0,
@@ -1026,13 +1166,6 @@ with st.sidebar:
     if displacement != st.session_state.displacement:
         st.session_state.displacement = displacement
         save_to_storage('displacement', displacement)
-    
-    windage_front = st.number_input("Windage Area Front (m²)", min_value=10.0, 
-                                    value=float(st.session_state.windage_front), step=10.0,
-                                    key="input_windage_front")
-    if windage_front != st.session_state.windage_front:
-        st.session_state.windage_front = windage_front
-        save_to_storage('windage_front', windage_front)
     
     windage_side = st.number_input("Windage Area Side (m²)", min_value=10.0, 
                                    value=float(st.session_state.windage_side), step=10.0,
@@ -1071,6 +1204,16 @@ with st.sidebar:
     if speed_knots != st.session_state.speed_knots:
         st.session_state.speed_knots = speed_knots
         save_to_storage('speed_knots', speed_knots)
+    
+    # DR Interval 선택
+    interval_idx = st.selectbox("DR Interval (hours)", options=range(len(INTERVAL_OPTIONS)),
+                                format_func=lambda x: f"{INTERVAL_OPTIONS[x]}h",
+                                index=int(st.session_state.interval_idx),
+                                key="input_interval")
+    if interval_idx != st.session_state.interval_idx:
+        st.session_state.interval_idx = interval_idx
+        save_to_storage('interval_idx', interval_idx)
+    interval_hours = INTERVAL_OPTIONS[interval_idx]
     
     # Time Zone 옵션 생성 (-12 ~ +13)
     tz_options = [f"UTC{'+' if i >= 0 else ''}{i}" for i in range(-12, 14)]
@@ -1137,10 +1280,10 @@ with st.expander("📁 Upload GPX Track & Actions", expanded=upload_expanded):
 
 if calculate_button and gpx_file and api_key:
     try:
-        # Vessel data 생성
+        # Vessel data 생성 (선종 기반)
         vessel = VesselData(
+            vessel_type=vessel_type,
             displacement=displacement,
-            windage_area_front=windage_front,
             windage_area_side=windage_side,
             loa=loa,
             breadth=breadth,
@@ -1152,6 +1295,9 @@ if calculate_button and gpx_file and api_key:
         progress_expander = st.expander("⚙️ Calculation Progress", expanded=True)
         
         with progress_expander:
+            # 선박 정보 표시
+            st.info(f"🚢 Vessel: {vessel_type} | Cb: {vessel.cb:.3f} | Wave Factor: {vessel.wave_resistance_factor}")
+            
             st.info("📍 Parsing GPX track...")
             track_points = parse_gpx(gpx_file)
             
@@ -1169,14 +1315,24 @@ if calculate_button and gpx_file and api_key:
             track = TrackLine(track_points)
             st.info(f"📏 Total track distance: {track.total_distance:.1f} nm")
             
-            # Step 1 & 2: 초기 DR 위치 계산 (정속 기준)
-            st.info("🧮 Calculating initial DR positions...")
-            initial_dr = calculate_dr_on_track(track, departure_datetime, speed_knots)
+            # 예상 항해 시간 계산 (대략적)
+            estimated_hours = track.total_distance / speed_knots
+            if estimated_hours > 240:
+                st.warning(f"⚠️ Estimated voyage: {estimated_hours:.0f} hours ({estimated_hours/24:.1f} days). Weather forecast is limited to ~10 days. Data beyond forecast range will be shown as NIL.")
+            
+            # Step 1 & 2: 초기 DR 위치 계산 (정속 기준, interval 적용)
+            st.info(f"🧮 Calculating initial DR positions (interval: {interval_hours}h)...")
+            initial_dr = calculate_dr_on_track(track, departure_datetime, speed_knots, interval_hours)
             st.success(f"✅ Generated {len(initial_dr)} DR positions")
             
-            # Step 3: 초기 DR 위치들의 기상 데이터 조회
+            # Step 3: 초기 DR 위치들의 기상 데이터 조회 (예보 범위 체크)
             st.info("🌤️ Fetching weather data for initial positions...")
-            initial_dr = fetch_weather_for_positions(initial_dr, api_key)
+            initial_dr = fetch_weather_for_positions(initial_dr, api_key, departure_datetime)
+            
+            # 예보 범위 초과 포인트 수 체크
+            no_weather_count = sum(1 for p in initial_dr if not p.get('weather_available', True))
+            if no_weather_count > 0:
+                st.warning(f"⚠️ {no_weather_count} positions are beyond weather forecast range (shown as NIL)")
             
             # 디버그: API 응답 키 확인
             if show_debug and initial_dr and len(initial_dr) > 1:
@@ -1195,11 +1351,11 @@ if calculate_button and gpx_file and api_key:
             
             # Step 4: 기상 영향 반영하여 DR 재계산
             st.info("🔄 Recalculating DR with weather effects...")
-            updated_dr = recalculate_dr_with_weather(initial_dr, track, vessel, departure_datetime)
+            updated_dr = recalculate_dr_with_weather(initial_dr, track, vessel, departure_datetime, interval_hours)
             
             # Step 5: 재계산된 위치의 기상 데이터 다시 조회
             st.info("🌤️ Fetching weather data for updated positions...")
-            final_dr = fetch_weather_for_positions(updated_dr, api_key)
+            final_dr = fetch_weather_for_positions(updated_dr, api_key, departure_datetime)
             
             # 결과 표시
             st.success("✅ Weather routing calculation completed!")
@@ -1210,6 +1366,7 @@ if calculate_button and gpx_file and api_key:
         st.session_state.track_points = track_points
         st.session_state.departure_datetime = departure_datetime
         st.session_state.arrival_tz = arrival_tz
+        st.session_state.speed_knots_saved = speed_knots  # 테이블용
         
         st.markdown("---")
         
@@ -1240,7 +1397,7 @@ if calculate_button and gpx_file and api_key:
         
         # 테이블 표시 (HTML with rotated arrows)
         st.subheader("📋 Detailed Forecast")
-        table_html = create_results_table_html(final_dr)
+        table_html = create_results_table_html(final_dr, speed_knots)
         
         # st.components.v1.html 사용하여 HTML 렌더링
         import streamlit.components.v1 as components
@@ -1265,6 +1422,7 @@ elif st.session_state.calculation_done and 'final_dr' in st.session_state and no
     track_points = st.session_state.get('track_points', [])
     departure_datetime = st.session_state.departure_datetime
     arrival_tz = st.session_state.arrival_tz
+    saved_speed = st.session_state.get('speed_knots_saved', speed_knots)
     
     st.markdown("---")
     st.header("📊 Routing Results")
@@ -1295,7 +1453,7 @@ elif st.session_state.calculation_done and 'final_dr' in st.session_state and no
     
     # 테이블 표시 (HTML with rotated arrows)
     st.subheader("📋 Detailed Forecast")
-    table_html = create_results_table_html(final_dr)
+    table_html = create_results_table_html(final_dr, saved_speed)
     
     import streamlit.components.v1 as components
     table_height = min(600, 50 + len(final_dr) * 40)
