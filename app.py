@@ -1008,6 +1008,9 @@ if 'initialized' not in st.session_state:
     st.session_state.dep_tz_idx = load_from_storage('dep_tz_idx', 12)  # UTC+0
     st.session_state.arr_tz_idx = load_from_storage('arr_tz_idx', 21)  # UTC+9
     st.session_state.calculation_done = False
+    # 출발 날짜/시간 초기화 (현재 시간)
+    st.session_state.departure_date = datetime.now().date()
+    st.session_state.departure_time = datetime.now().replace(second=0, microsecond=0).time()
 
 # Streamlit UI
 st.title("⛵ Weather Routing Calculator")
@@ -1093,8 +1096,15 @@ with st.sidebar:
             save_to_storage('arr_tz_idx', arr_tz_idx)
         arrival_tz = tz_values[arr_tz_idx]
     
-    departure_date = st.date_input("Departure Date (LT)", datetime.now().date())
-    departure_time = st.time_input("Departure Time (LT)", datetime.now().time())
+    departure_date = st.date_input("Departure Date (LT)", 
+                                    value=st.session_state.departure_date,
+                                    key="input_departure_date")
+    st.session_state.departure_date = departure_date
+    
+    departure_time = st.time_input("Departure Time (LT)", 
+                                    value=st.session_state.departure_time,
+                                    key="input_departure_time")
+    st.session_state.departure_time = departure_time
     
     # 로컬 시간을 UTC로 변환
     departure_local = datetime.combine(departure_date, departure_time)
