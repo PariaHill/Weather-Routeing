@@ -709,8 +709,14 @@ def get_noaa_weather(lat: float, lon: float, target_time: datetime,
         weather_data['error'] = 'No GFS cycle available'
         return weather_data
     
+    # target_time을 UTC aware로 변환 (naive datetime인 경우)
+    if target_time.tzinfo is None:
+        target_time_utc = target_time.replace(tzinfo=timezone.utc)
+    else:
+        target_time_utc = target_time
+    
     # 예보 시간 계산 (cycle_time 기준 몇 시간 후인지)
-    hours_from_cycle = (target_time - cycle_time).total_seconds() / 3600
+    hours_from_cycle = (target_time_utc - cycle_time).total_seconds() / 3600
     
     # 3시간 간격으로 반올림
     fhour = round(hours_from_cycle / 3) * 3
