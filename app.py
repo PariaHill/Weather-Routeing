@@ -1,14 +1,24 @@
 import streamlit as st
 import gpxpy
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import math
 import pandas as pd
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import json
 import folium
 from streamlit_folium import st_folium
 from folium.plugins import AntPath
+import tempfile
+import os
+
+# GRIB2 처리용 (NOAA GFS)
+try:
+    import xarray as xr
+    import cfgrib
+    GRIB_AVAILABLE = True
+except ImportError:
+    GRIB_AVAILABLE = False
 
 # Page config - must be first Streamlit command
 st.set_page_config(page_title="Weather Routing Calculator", layout="wide")
@@ -329,30 +339,41 @@ def calculate_dr_on_track(track: TrackLine, start_time: datetime,
 def fetch_weather_for_positions(dr_positions: List[Dict], api_key: str, 
                                  start_time: datetime) -> List[Dict]:
     """
-    Step 3 & 5: DR 위치들의 기상 데이터 조회
-    Windy API는 약 10일(240시간) 예보만 제공하므로, 그 이후는 NIL 처리
+    Step 3 & 5: DR 위치들의 기상 데이터 조회 (NOAA GFS 사용)
+    NOAA GFS는 최대 384시간(16일) 예보 제공
+    api_key 파라미터는 호환성을 위해 유지 (NOAA는 키 불필요)
     """
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Windy API 예보 한계 (약 10일 = 240시간)
-    FORECAST_LIMIT_HOURS = 240
+    # NOAA GFS 예보 한계 (약 16일 = 384시간)
+    FORECAST_LIMIT_HOURS = 384
+    
+    # GFS 사이클 캐시 (한 번만 찾기)
+    gfs_cache = {}
+    
+    # GRIB 라이브러리 가용성 체크
+    if not GRIB_AVAILABLE:
+        st.warning("⚠️ GRIB libraries (xarray, cfgrib) not available. Install with: pip install xarray cfgrib eccodes")
     
     for i, point in enumerate(dr_positions):
-        status_text.text(f"Fetching weather data: {i+1}/{len(dr_positions)}")
+        status_text.text(f"Fetching NOAA GFS data: {i+1}/{len(dr_positions)}")
         progress_bar.progress((i + 1) / len(dr_positions))
         
         # 출발 시간 대비 경과 시간 계산
         hours_from_start = (point['time'] - start_time).total_seconds() / 3600
         
-        if hours_from_start <= FORECAST_LIMIT_HOURS:
-            # 예보 범위 내: API 조회
-            weather_data = get_windy_weather(point['lat'], point['lon'], api_key)
-            weather = parse_windy_data(weather_data, point['time'])
+        if hours_from_start <= FORECAST_LIMIT_HOURS and GRIB_AVAILABLE:
+            # 예보 범위 내: NOAA GFS 조회
+            weather_data = get_noaa_weather(point['lat'], point['lon'], 
+                                           point['time'], gfs_cache)
+            weather = parse_noaa_data(weather_data, point['time'])
             point['weather'] = weather
             point['weather_available'] = True
+            point['gfs_cycle'] = weather_data.get('cycle', 'N/A')
+            point['gfs_fhour'] = weather_data.get('fhour', 0)
         else:
-            # 예보 범위 초과: NIL 처리
+            # 예보 범위 초과 또는 GRIB 불가: NIL 처리
             point['weather'] = WeatherPoint(point['time'], point['lat'], point['lon'])
             point['weather_available'] = False
     
@@ -485,142 +506,285 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
     
     return new_dr
 
-def get_windy_weather(lat: float, lon: float, api_key: str) -> Dict:
-    """Windy API로 기상 데이터 조회"""
+########################################
+# NOAA GFS 데이터 관련 함수들
+########################################
+
+def find_latest_gfs_cycle() -> Tuple[Optional[str], Optional[int], Optional[datetime]]:
+    """
+    최신 GFS 사이클 찾기 (00Z, 06Z, 12Z, 18Z)
+    NOAA 서버에서 사용 가능한 최신 사이클 확인
+    """
+    now = datetime.now(timezone.utc)
+    
+    # 최근 24시간 내 사이클 확인 (최신 순)
+    for hours_ago in range(0, 25, 6):
+        check_time = now - timedelta(hours=hours_ago)
+        date_str = check_time.strftime('%Y%m%d')
+        
+        # 해당 날짜의 사이클 확인 (18, 12, 06, 00)
+        for cycle in [18, 12, 6, 0]:
+            cycle_time = check_time.replace(hour=cycle, minute=0, second=0, microsecond=0)
+            if cycle_time > now:
+                continue
+            
+            # 데이터 가용 여부 확인 (HEAD 요청으로 빠르게)
+            url = (f"https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?"
+                   f"dir=%2Fgfs.{date_str}%2F{cycle:02d}%2Fatmos&"
+                   f"file=gfs.t{cycle:02d}z.pgrb2.0p25.f000&"
+                   f"var_PRMSL=on&lev_mean_sea_level=on&"
+                   f"subregion=&toplat=32&leftlon=126&rightlon=127&bottomlat=31")
+            
+            try:
+                resp = requests.head(url, timeout=10)
+                if resp.status_code == 200:
+                    return date_str, cycle, cycle_time
+            except:
+                continue
+    
+    return None, None, None
+
+def build_subregion_params(lat: float, lon: float, margin: float = 0.5) -> str:
+    """입력 좌표 기준 서브리전 파라미터 생성 (0.25도 그리드에 맞춤)"""
+    lat_min = math.floor((lat - margin) * 4) / 4
+    lat_max = math.ceil((lat + margin) * 4) / 4
+    lon_min = math.floor((lon - margin) * 4) / 4
+    lon_max = math.ceil((lon + margin) * 4) / 4
+    
+    return f"subregion=&toplat={lat_max}&leftlon={lon_min}&rightlon={lon_max}&bottomlat={lat_min}"
+
+def fetch_gfs_atmosphere(date_str: str, cycle: int, fhour: int, lat: float, lon: float) -> Optional[bytes]:
+    """GFS Atmosphere 모델에서 PRMSL(기압), GUST(돌풍) 가져오기"""
+    subregion = build_subregion_params(lat, lon)
+    url = (f"https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?"
+           f"dir=%2Fgfs.{date_str}%2F{cycle:02d}%2Fatmos&"
+           f"file=gfs.t{cycle:02d}z.pgrb2.0p25.f{fhour:03d}&"
+           f"var_PRMSL=on&var_GUST=on&"
+           f"lev_mean_sea_level=on&lev_surface=on&"
+           f"{subregion}")
+    
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200 and len(resp.content) > 100:
+            return resp.content
+    except:
+        pass
+    return None
+
+def fetch_gfswave(date_str: str, cycle: int, fhour: int, lat: float, lon: float) -> Optional[bytes]:
+    """GFS Wave 모델에서 바람 및 파도 데이터 가져오기"""
+    subregion = build_subregion_params(lat, lon)
+    
+    url = (f"https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl?"
+           f"dir=%2Fgfs.{date_str}%2F{cycle:02d}%2Fwave%2Fgridded&"
+           f"file=gfswave.t{cycle:02d}z.global.0p25.f{fhour:03d}.grib2&"
+           f"var_WIND=on&var_WDIR=on&var_UGRD=on&var_VGRD=on&"
+           f"var_HTSGW=on&var_DIRPW=on&var_PERPW=on&"
+           f"var_SWELL=on&var_SWDIR=on&var_SWPER=on&"
+           f"lev_surface=on&lev_1_in_sequence=on&"
+           f"{subregion}")
+    
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200 and len(resp.content) > 100:
+            return resp.content
+    except:
+        pass
+    return None
+
+def parse_grib_data(grib_bytes: Optional[bytes], lat: float, lon: float) -> Dict:
+    """GRIB2 데이터 파싱하여 딕셔너리로 반환"""
+    if grib_bytes is None or len(grib_bytes) < 100:
+        return {}
+    
+    if not GRIB_AVAILABLE:
+        return {'error': 'GRIB libraries not available'}
+    
+    result = {}
+    temp_path = None
+    
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.grib2', delete=False) as f:
+            f.write(grib_bytes)
+            temp_path = f.name
+        
+        # 여러 필터 설정으로 시도
+        filter_configs = [
+            {'typeOfLevel': 'surface'},
+            {'typeOfLevel': 'meanSea'},
+            {'typeOfLevel': 'orderedSequence'},
+            {},
+        ]
+        
+        for filter_keys in filter_configs:
+            try:
+                if filter_keys:
+                    ds = xr.open_dataset(temp_path, engine='cfgrib',
+                                       backend_kwargs={'filter_by_keys': filter_keys, 'errors': 'ignore'})
+                else:
+                    ds = xr.open_dataset(temp_path, engine='cfgrib',
+                                       backend_kwargs={'errors': 'ignore'})
+            except:
+                continue
+            
+            if ds is None:
+                continue
+            
+            # 좌표 이름 확인
+            lat_name = 'latitude' if 'latitude' in ds.coords else 'lat'
+            lon_name = 'longitude' if 'longitude' in ds.coords else 'lon'
+            
+            # 가장 가까운 좌표로 데이터 추출
+            try:
+                ds_point = ds.sel({lat_name: lat, lon_name: lon}, method='nearest')
+            except:
+                continue
+            
+            # 변수들 추출
+            var_mapping = {
+                # GFS Atmosphere
+                'prmsl': 'pressure',
+                'gust': 'gust',
+                # GFS Wave
+                'wind': 'wind_speed',
+                'wdir': 'wind_dir',
+                'u10': 'wind_u',
+                'v10': 'wind_v',
+                'ugrd': 'wind_u',
+                'vgrd': 'wind_v',
+                'htsgw': 'wave_height',
+                'dirpw': 'wave_dir',
+                'perpw': 'wave_period',
+                'swell': 'swell_height',
+                'swdir': 'swell_dir',
+                'swper': 'swell_period',
+            }
+            
+            for var_name in ds_point.data_vars:
+                var_lower = var_name.lower()
+                for grib_var, result_key in var_mapping.items():
+                    if grib_var in var_lower:
+                        try:
+                            val = float(ds_point[var_name].values)
+                            if not math.isnan(val):
+                                result[result_key] = val
+                        except:
+                            pass
+                        break
+            
+            ds.close()
+        
+    except Exception as e:
+        result['parse_error'] = str(e)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+    
+    return result
+
+def get_noaa_weather(lat: float, lon: float, target_time: datetime, 
+                     gfs_cache: Dict) -> Dict:
+    """
+    NOAA GFS에서 특정 위치/시간의 기상 데이터 조회
+    gfs_cache: {'date_str': str, 'cycle': int, 'cycle_time': datetime} 캐시
+    """
     weather_data = {}
     
-    # GFS 모델 (wind, pressure)
-    try:
-        gfs_payload = {
-            "lat": lat,
-            "lon": lon,
-            "model": "gfs",
-            "parameters": ["wind", "windGust", "pressure"],
-            "levels": ["surface"],
-            "key": api_key
-        }
-        
-        gfs_response = requests.post(
-            "https://api.windy.com/api/point-forecast/v2",
-            json=gfs_payload,
-            timeout=10
-        )
-        
-        if gfs_response.status_code == 200:
-            gfs_data = gfs_response.json()
-            weather_data['gfs'] = gfs_data
-        else:
-            weather_data['gfs_error'] = f"Status: {gfs_response.status_code}, Response: {gfs_response.text[:200]}"
-    except Exception as e:
-        weather_data['gfs_error'] = f"Exception: {str(e)}"
+    # 캐시된 사이클 정보 사용 또는 새로 찾기
+    if not gfs_cache.get('date_str'):
+        date_str, cycle, cycle_time = find_latest_gfs_cycle()
+        if date_str:
+            gfs_cache['date_str'] = date_str
+            gfs_cache['cycle'] = cycle
+            gfs_cache['cycle_time'] = cycle_time
     
-    # GFS Wave 모델
-    try:
-        wave_payload = {
-            "lat": lat,
-            "lon": lon,
-            "model": "gfsWave",
-            "parameters": ["waves", "swell1", "swell2"],
-            "levels": ["surface"],
-            "key": api_key
-        }
-        
-        wave_response = requests.post(
-            "https://api.windy.com/api/point-forecast/v2",
-            json=wave_payload,
-            timeout=10
-        )
-        
-        if wave_response.status_code == 200:
-            wave_data = wave_response.json()
-            weather_data['wave'] = wave_data
-        else:
-            weather_data['wave_error'] = f"Status: {wave_response.status_code}, Response: {wave_response.text[:200]}"
-    except Exception as e:
-        weather_data['wave_error'] = f"Exception: {str(e)}"
+    date_str = gfs_cache.get('date_str')
+    cycle = gfs_cache.get('cycle')
+    cycle_time = gfs_cache.get('cycle_time')
+    
+    if not date_str or cycle is None:
+        weather_data['error'] = 'No GFS cycle available'
+        return weather_data
+    
+    # 예보 시간 계산 (cycle_time 기준 몇 시간 후인지)
+    hours_from_cycle = (target_time - cycle_time).total_seconds() / 3600
+    
+    # 3시간 간격으로 반올림
+    fhour = round(hours_from_cycle / 3) * 3
+    fhour = max(0, min(fhour, 384))  # 0~384시간 범위
+    
+    weather_data['fhour'] = fhour
+    weather_data['cycle'] = f"{date_str} {cycle:02d}Z"
+    
+    # GFS Atmosphere (기압, 돌풍)
+    atm_data = fetch_gfs_atmosphere(date_str, cycle, fhour, lat, lon)
+    if atm_data:
+        parsed_atm = parse_grib_data(atm_data, lat, lon)
+        weather_data.update(parsed_atm)
+    
+    # GFS Wave (바람, 파도, 너울)
+    wave_data = fetch_gfswave(date_str, cycle, fhour, lat, lon)
+    if wave_data:
+        parsed_wave = parse_grib_data(wave_data, lat, lon)
+        weather_data.update(parsed_wave)
+    
+    # wind_u, wind_v가 있으면 풍속/풍향 계산
+    if 'wind_u' in weather_data and 'wind_v' in weather_data:
+        u = weather_data['wind_u']
+        v = weather_data['wind_v']
+        weather_data['wind_speed'] = math.sqrt(u**2 + v**2)
+        weather_data['wind_dir'] = (math.degrees(math.atan2(u, v)) + 180) % 360
     
     return weather_data
 
-def parse_windy_data(weather_data: Dict, target_time: datetime) -> WeatherPoint:
-    """Windy API 응답에서 가장 가까운 시간의 데이터 추출"""
+def parse_noaa_data(weather_data: Dict, target_time: datetime) -> WeatherPoint:
+    """NOAA GFS 데이터를 WeatherPoint 객체로 변환"""
     result = WeatherPoint(target_time, 0, 0)
     
-    if 'gfs' in weather_data:
-        gfs = weather_data['gfs']
-        timestamps = gfs.get('ts', [])
-        
-        # 가장 가까운 시간 찾기
-        target_ts = int(target_time.timestamp() * 1000)
-        closest_idx = 0
-        min_diff = abs(timestamps[0] - target_ts)
-        
-        for i, ts in enumerate(timestamps):
-            diff = abs(ts - target_ts)
-            if diff < min_diff:
-                min_diff = diff
-                closest_idx = i
-        
-        # Wind 데이터
-        if 'wind_u-surface' in gfs and 'wind_v-surface' in gfs:
-            u = gfs['wind_u-surface'][closest_idx]
-            v = gfs['wind_v-surface'][closest_idx]
-            wind_speed = math.sqrt(u**2 + v**2)
-            wind_dir = (math.degrees(math.atan2(u, v)) + 180) % 360  # Coming from
-            result.wind_speed = wind_speed
-            result.wind_dir = wind_dir
-        
-        # Wind gust
-        if 'gust-surface' in gfs:
-            result.wind_gust = gfs['gust-surface'][closest_idx]
-        
-        # Pressure
-        if 'pressure-surface' in gfs:
-            result.pressure = gfs['pressure-surface'][closest_idx]
+    # 기압 (Pa -> hPa 변환)
+    if 'pressure' in weather_data:
+        pressure = weather_data['pressure']
+        if pressure > 10000:  # Pa 단위면 hPa로 변환
+            pressure = pressure / 100
+        result.pressure = pressure * 100  # 다시 Pa로 (기존 로직과 호환)
     
-    if 'wave' in weather_data:
-        wave = weather_data['wave']
-        timestamps = wave.get('ts', [])
-        
-        if timestamps:
-            target_ts = int(target_time.timestamp() * 1000)
-            closest_idx = 0
-            min_diff = abs(timestamps[0] - target_ts)
-            
-            for i, ts in enumerate(timestamps):
-                diff = abs(ts - target_ts)
-                if diff < min_diff:
-                    min_diff = diff
-                    closest_idx = i
-            
-            # Wave 높이 - 여러 가능한 키 시도
-            wave_height_keys = ['waves_height-surface', 'waves-surface', 'wavesHeight-surface']
-            for key in wave_height_keys:
-                if key in wave:
-                    result.wave_height = wave[key][closest_idx]
-                    break
-            
-            # Wave 방향
-            wave_dir_keys = ['waves_direction-surface', 'wavesDirection-surface', 'waves_dir-surface']
-            for key in wave_dir_keys:
-                if key in wave:
-                    result.wave_dir = wave[key][closest_idx]
-                    break
-            
-            # Swell 높이
-            swell_height_keys = ['swell1_height-surface', 'swell1-surface', 'swellHeight-surface']
-            for key in swell_height_keys:
-                if key in wave:
-                    result.swell_height = wave[key][closest_idx]
-                    break
-            
-            # Swell 방향
-            swell_dir_keys = ['swell1_direction-surface', 'swell1Direction-surface', 'swell1_dir-surface']
-            for key in swell_dir_keys:
-                if key in wave:
-                    result.swell_dir = wave[key][closest_idx]
-                    break
+    # 바람
+    if 'wind_speed' in weather_data:
+        result.wind_speed = weather_data['wind_speed']
+    if 'wind_dir' in weather_data:
+        result.wind_dir = weather_data['wind_dir']
+    
+    # 돌풍
+    if 'gust' in weather_data:
+        result.wind_gust = weather_data['gust']
+    
+    # 파도
+    if 'wave_height' in weather_data:
+        result.wave_height = weather_data['wave_height']
+    if 'wave_dir' in weather_data:
+        result.wave_dir = weather_data['wave_dir']
+    
+    # 너울
+    if 'swell_height' in weather_data:
+        result.swell_height = weather_data['swell_height']
+    if 'swell_dir' in weather_data:
+        result.swell_dir = weather_data['swell_dir']
     
     return result
+
+# 기존 Windy 함수들은 NOAA로 대체됨 (호환성을 위해 래퍼 함수 제공)
+def get_windy_weather(lat: float, lon: float, api_key: str) -> Dict:
+    """[DEPRECATED] Windy API 대신 NOAA GFS 사용 - 호환성 래퍼"""
+    # 이 함수는 더 이상 사용되지 않음
+    # 새 코드는 get_noaa_weather() 사용
+    return {}
+
+def parse_windy_data(weather_data: Dict, target_time: datetime) -> WeatherPoint:
+    """[DEPRECATED] Windy 파싱 대신 NOAA 파싱 사용 - 호환성 래퍼"""
+    return parse_noaa_data(weather_data, target_time)
 
 def calculate_wind_resistance(vessel: VesselData, wind_speed_ms: float, 
                               wind_dir: float, vessel_heading: float) -> float:
@@ -1254,17 +1418,19 @@ with st.sidebar:
     departure_datetime = departure_local - timedelta(hours=departure_tz)
     
     st.markdown("---")
-    # Windy API 키는 Streamlit secrets에서만 읽음
-    try:
-        api_key = st.secrets["WINDY_API_KEY"]
-        st.success("✅ API Key loaded")
-    except:
-        api_key = ""
-        st.error("❌ WINDY_API_KEY not found in secrets")
+    # NOAA GFS는 API 키 불필요
+    st.info("🌐 Data Source: NOAA GFS (No API key required)")
+    if GRIB_AVAILABLE:
+        st.success("✅ GRIB libraries available")
+    else:
+        st.warning("⚠️ GRIB libraries not installed. Run: pip install xarray cfgrib eccodes")
+    
+    # 호환성을 위해 api_key 변수 유지 (NOAA는 사용 안함)
+    api_key = "NOAA_GFS"
     
     st.markdown("---")
     st.header("Debug Options")
-    show_debug = st.checkbox("Show API response keys", value=False)
+    show_debug = st.checkbox("Show API response details", value=False)
 
 # Main area - 계산 완료 후에는 접힌 상태로
 upload_expanded = not st.session_state.calculation_done
@@ -1278,7 +1444,7 @@ with st.expander("📁 Upload GPX Track & Actions", expanded=upload_expanded):
         st.markdown("<br>", unsafe_allow_html=True)  # 간격 조정
         calculate_button = st.button("🧭 Calculate Route", type="primary", use_container_width=True)
 
-if calculate_button and gpx_file and api_key:
+if calculate_button and gpx_file:
     try:
         # Vessel data 생성 (선종 기반)
         vessel = VesselData(
@@ -1334,20 +1500,20 @@ if calculate_button and gpx_file and api_key:
             if no_weather_count > 0:
                 st.warning(f"⚠️ {no_weather_count} positions are beyond weather forecast range (shown as NIL)")
             
-            # 디버그: API 응답 키 확인
+            # 디버그: NOAA GFS 응답 확인
             if show_debug and initial_dr and len(initial_dr) > 1:
-                test_weather = get_windy_weather(initial_dr[1]['lat'], initial_dr[1]['lon'], api_key)
-                with st.expander("🔍 Debug: API Response", expanded=True):
-                    if 'gfs' in test_weather:
-                        st.success("✅ GFS API OK")
-                        st.write("**GFS Keys:**", list(test_weather['gfs'].keys()))
-                    if 'gfs_error' in test_weather:
-                        st.error(f"❌ GFS Error: {test_weather['gfs_error']}")
-                    if 'wave' in test_weather:
-                        st.success("✅ Wave API OK")
-                        st.write("**Wave Keys:**", list(test_weather['wave'].keys()))
-                    if 'wave_error' in test_weather:
-                        st.error(f"❌ Wave Error: {test_weather['wave_error']}")
+                with st.expander("🔍 Debug: NOAA GFS Response", expanded=True):
+                    sample_point = initial_dr[1]
+                    st.write("**GFS Cycle:**", sample_point.get('gfs_cycle', 'N/A'))
+                    st.write("**Forecast Hour:**", sample_point.get('gfs_fhour', 'N/A'))
+                    
+                    weather = sample_point.get('weather')
+                    if weather:
+                        st.write("**Weather Data:**")
+                        st.write(f"  - Pressure: {weather.pressure}")
+                        st.write(f"  - Wind: {weather.wind_dir}° / {weather.wind_speed} m/s")
+                        st.write(f"  - Wave: {weather.wave_dir}° / {weather.wave_height} m")
+                        st.write(f"  - Swell: {weather.swell_dir}° / {weather.swell_height} m")
             
             # Step 4: 기상 영향 반영하여 DR 재계산
             st.info("🔄 Recalculating DR with weather effects...")
@@ -1413,8 +1579,6 @@ if calculate_button and gpx_file and api_key:
 elif calculate_button:
     if not gpx_file:
         st.warning("⚠️ Please upload a GPX file")
-    if not api_key:
-        st.warning("⚠️ Please provide Windy API key")
 
 # 이전 계산 결과가 있으면 표시 (새로 계산하지 않은 경우)
 elif st.session_state.calculation_done and 'final_dr' in st.session_state and not calculate_button:
@@ -1463,6 +1627,6 @@ elif st.session_state.calculation_done and 'final_dr' in st.session_state and no
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: gray; font-size: 0.8em;'>
-Weather Routing Calculator | Wind/Wave data from Windy.com
+Weather Routing Calculator | Data Source: NOAA GFS & GFS-Wave (0.25° Resolution)
 </div>
 """, unsafe_allow_html=True)
