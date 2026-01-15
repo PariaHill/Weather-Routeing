@@ -877,89 +877,114 @@ def parse_windy_data(weather_data: Dict, target_time: datetime) -> WeatherPoint:
     return parse_noaa_data(weather_data, target_time)
 
 ########################################
-# NOAA RTOFS 해류 데이터 (OpenDAP)
+# NOAA RTOFS 해류 데이터 (ERDDAP griddap)
 ########################################
 
 def get_rtofs_current(lat: float, lon: float, target_time: datetime) -> Dict:
     """
-    NOAA RTOFS에서 해류 데이터 가져오기 (OpenDAP)
-    Returns: {'u_current': m/s, 'v_current': m/s} 또는 빈 딕셔너리
+    NOAA RTOFS에서 해류 데이터 가져오기 (CoastWatch ERDDAP griddap)
+    
+    ERDDAP Dataset: ncepRtofsG2DFore3hrlyProg_LonPM180
+    - 경도 범위: -180 ~ 180 (표준 형식)
+    - 해상도: 1/12° (약 0.083°)
+    - 예보: 8일, 3시간 간격
+    - 변수: u_velocity (동서), v_velocity (남북)
+    
+    Returns: {'u_current': m/s, 'v_current': m/s, 'current_speed': m/s, 'current_dir': deg} 또는 빈 딕셔너리
     """
     result = {}
     
     try:
-        # RTOFS는 경도를 0~360 범위로 사용
-        lon_360 = lon if lon >= 0 else lon + 360
+        # target_time을 UTC로 변환 (naive datetime인 경우)
+        if target_time.tzinfo is None:
+            target_time_utc = target_time.replace(tzinfo=timezone.utc)
+        else:
+            target_time_utc = target_time
         
-        # 현재 시간 기준 가장 가까운 RTOFS 예보 시간 찾기
-        # RTOFS는 하루 2회 (00Z, 12Z) 업데이트
-        now_utc = datetime.now(timezone.utc)
+        # 시간을 ISO 8601 형식으로 변환
+        time_str = target_time_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
         
-        # 최근 RTOFS 날짜 (1-2일 전 데이터가 안정적)
-        rtofs_date = (now_utc - timedelta(days=1)).strftime('%Y%m%d')
+        # ERDDAP griddap JSON URL 생성
+        # 형식: variable[(time)][(pressure)][(lat)][(lon)]
+        # pressure는 항상 1.0 (표층)
+        # 가장 가까운 시간/위치 데이터를 가져옴
+        base_url = "https://coastwatch.pfeg.noaa.gov/erddap/griddap/ncepRtofsG2DFore3hrlyProg_LonPM180.json"
         
-        # target_time과 RTOFS 기준시간의 차이로 forecast hour 계산
-        # 간단히 24시간 예보 사용 (f024)
-        forecast_hour = 24
+        # 위경도 범위 지정 (정확한 포인트)
+        # ERDDAP은 가장 가까운 그리드 포인트를 반환
+        query = f"?u_velocity[({time_str})][(1.0)][({lat}):1:({lat})][({lon}):1:({lon})],v_velocity[({time_str})][(1.0)][({lat}):1:({lat})][({lon}):1:({lon})]"
         
-        # OpenDAP URL (2D 표층 해류)
-        # RTOFS 2D diagnostic fields
-        base_url = f"https://nomads.ncep.noaa.gov/dods/rtofs/rtofs_global{rtofs_date}/rtofs_glo_2ds_f{forecast_hour:03d}_daily_diag"
+        url = base_url + query
         
-        # 위경도 인덱스 계산 (RTOFS 해상도: 1/12도 ≈ 0.083도)
-        # 위도: -80 ~ 90, 경도: 0 ~ 360
-        lat_idx = int((lat + 80) / 0.083)
-        lon_idx = int(lon_360 / 0.083)
+        resp = requests.get(url, timeout=20)
         
-        # 범위 제한
-        lat_idx = max(0, min(lat_idx, 2040))
-        lon_idx = max(0, min(lon_idx, 4319))
+        if resp.status_code == 200:
+            data = resp.json()
+            
+            # ERDDAP JSON 응답 구조:
+            # {
+            #   "table": {
+            #     "columnNames": ["time", "pressure", "latitude", "longitude", "u_velocity", "v_velocity"],
+            #     "rows": [[...]]
+            #   }
+            # }
+            
+            if 'table' in data and 'rows' in data['table'] and len(data['table']['rows']) > 0:
+                row = data['table']['rows'][0]
+                col_names = data['table']['columnNames']
+                
+                # 컬럼 인덱스 찾기
+                u_idx = col_names.index('u_velocity') if 'u_velocity' in col_names else -1
+                v_idx = col_names.index('v_velocity') if 'v_velocity' in col_names else -1
+                
+                if u_idx >= 0 and row[u_idx] is not None:
+                    u_val = float(row[u_idx])
+                    if abs(u_val) < 10:  # 현실적인 범위 체크 (10 m/s 미만)
+                        result['u_current'] = u_val
+                
+                if v_idx >= 0 and row[v_idx] is not None:
+                    v_val = float(row[v_idx])
+                    if abs(v_val) < 10:
+                        result['v_current'] = v_val
         
-        # U 성분 (동서 방향 해류)
-        u_url = f"{base_url}.ascii?u_velocity[0][{lat_idx}][{lon_idx}]"
-        resp_u = requests.get(u_url, timeout=15)
-        
-        if resp_u.status_code == 200:
-            # OpenDAP ASCII 응답 파싱
-            lines = resp_u.text.strip().split('\n')
-            for line in lines:
-                if line.startswith('u_velocity'):
-                    continue
-                if ',' in line or line.replace('.','').replace('-','').replace('e','').replace('+','').isdigit():
-                    try:
-                        # 마지막 숫자값 추출
-                        val = float(line.split(',')[-1].strip() if ',' in line else line.strip())
-                        if abs(val) < 10:  # 현실적인 범위 (10 m/s 미만)
-                            result['u_current'] = val
-                    except:
-                        pass
-                    break
-        
-        # V 성분 (남북 방향 해류)
-        v_url = f"{base_url}.ascii?v_velocity[0][{lat_idx}][{lon_idx}]"
-        resp_v = requests.get(v_url, timeout=15)
-        
-        if resp_v.status_code == 200:
-            lines = resp_v.text.strip().split('\n')
-            for line in lines:
-                if line.startswith('v_velocity'):
-                    continue
-                if ',' in line or line.replace('.','').replace('-','').replace('e','').replace('+','').isdigit():
-                    try:
-                        val = float(line.split(',')[-1].strip() if ',' in line else line.strip())
-                        if abs(val) < 10:
-                            result['v_current'] = val
-                    except:
-                        pass
-                    break
+        elif resp.status_code == 404:
+            # 시간이 범위를 벗어난 경우, 최신 데이터 시도
+            # last 키워드 사용
+            query_latest = f"?u_velocity[(last)][(1.0)][({lat}):1:({lat})][({lon}):1:({lon})],v_velocity[(last)][(1.0)][({lat}):1:({lat})][({lon}):1:({lon})]"
+            url_latest = base_url + query_latest
+            
+            resp_latest = requests.get(url_latest, timeout=20)
+            if resp_latest.status_code == 200:
+                data = resp_latest.json()
+                if 'table' in data and 'rows' in data['table'] and len(data['table']['rows']) > 0:
+                    row = data['table']['rows'][0]
+                    col_names = data['table']['columnNames']
+                    
+                    u_idx = col_names.index('u_velocity') if 'u_velocity' in col_names else -1
+                    v_idx = col_names.index('v_velocity') if 'v_velocity' in col_names else -1
+                    
+                    if u_idx >= 0 and row[u_idx] is not None:
+                        u_val = float(row[u_idx])
+                        if abs(u_val) < 10:
+                            result['u_current'] = u_val
+                    
+                    if v_idx >= 0 and row[v_idx] is not None:
+                        v_val = float(row[v_idx])
+                        if abs(v_val) < 10:
+                            result['v_current'] = v_val
         
         # 해류 속력 및 방향 계산
         if 'u_current' in result and 'v_current' in result:
             u = result['u_current']
             v = result['v_current']
             result['current_speed'] = math.sqrt(u**2 + v**2)
-            result['current_dir'] = (math.degrees(math.atan2(u, v)) + 360) % 360  # 흐르는 방향
+            # 해류가 흐르는 방향 (from이 아닌 to 방향)
+            result['current_dir'] = (math.degrees(math.atan2(u, v)) + 360) % 360
             
+    except requests.exceptions.Timeout:
+        result['rtofs_error'] = 'ERDDAP request timeout'
+    except requests.exceptions.RequestException as e:
+        result['rtofs_error'] = f'ERDDAP request error: {str(e)}'
     except Exception as e:
         result['rtofs_error'] = str(e)
     
