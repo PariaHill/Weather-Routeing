@@ -17,6 +17,7 @@ Track/Route File Parser Module for Weather Routing Calculator
 import xml.etree.ElementTree as ET
 import json
 import re
+import math
 from typing import List, Tuple, Optional, Dict, Any
 from io import StringIO, BytesIO
 
@@ -46,7 +47,17 @@ def detect_format(file_content: bytes, filename: str) -> str:
     """파일 내용과 확장자로 형식 감지"""
     ext = filename.lower().split('.')[-1] if '.' in filename else ''
     
-    # 확장자 기반 1차 판단
+    # 내용 기반 우선 판단 (시그니처 체크)
+    try:
+        content_str = file_content.decode('utf-8', errors='ignore')[:2000]
+    except:
+        content_str = ''
+    
+    # SAM Electronics (Wärtsilä) ATLAS 형식 - 시그니처로 먼저 감지
+    if content_str.startswith('ATLAS/PS-E'):
+        return 'sam_atlas'
+    
+    # 확장자 기반 판단
     if ext == 'gpx':
         return 'gpx'
     elif ext == 'rtz':
@@ -59,11 +70,6 @@ def detect_format(file_content: bytes, filename: str) -> str:
         return 'geojson'
     
     # 내용 기반 2차 판단
-    try:
-        content_str = file_content.decode('utf-8', errors='ignore')[:2000]
-    except:
-        content_str = ''
-    
     if '<gpx' in content_str.lower():
         return 'gpx'
     elif '<route' in content_str.lower() and 'xmlns' in content_str:
@@ -108,6 +114,7 @@ def parse_route_file(file_obj, filename: str = "route") -> RouteParseResult:
         'furuno': parse_furuno_rou,
         'csv': parse_csv,
         'geojson': parse_geojson,
+        'sam_atlas': parse_sam_atlas,
     }
     
     parser = parsers.get(format_type)
@@ -633,6 +640,95 @@ def parse_geojson(content: bytes) -> RouteParseResult:
         return RouteParseResult(
             points=[],
             format_name='GeoJSON',
+            metadata={'error': str(e)}
+        )
+
+
+def parse_sam_atlas(content: bytes) -> RouteParseResult:
+    """
+    SAM Electronics (Wärtsilä) ATLAS ECDIS Track 파서
+    
+    형식:
+    - 시그니처: ATLAS/PS-Ev2.0
+    - 웨이포인트 블록: [3,28] 태그로 시작
+    - 좌표: 라디안 형식 (위도, 경도 순서)
+    - 웨이포인트 이름: 좌표+타임스탬프 다음 줄
+    
+    예:
+    [3,28]
+    0.6105205357    <- 위도 (라디안)
+    2.24548971      <- 경도 (라디안)
+    1683525412      <- Unix timestamp
+    KTS DEPOT       <- 웨이포인트 이름 (선택적)
+    """
+    try:
+        content_str = content.decode('utf-8', errors='ignore')
+        lines = content_str.split('\n')
+        
+        points = []
+        waypoint_names = []
+        route_name = None
+        
+        # 라우트 이름 추출 시도 (보통 [0,5] 섹션 다음)
+        for i, line in enumerate(lines[:10]):
+            if line.strip() and not line.startswith('[') and not line.startswith('ATLAS'):
+                if not line.isdigit() and len(line.strip()) > 2:
+                    route_name = line.strip()
+                    break
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # 웨이포인트 블록 시작 감지
+            if line == '[3,28]':
+                # 다음 줄들에서 좌표 읽기
+                if i + 2 < len(lines):
+                    try:
+                        lat_rad = float(lines[i + 1].strip())
+                        lon_rad = float(lines[i + 2].strip())
+                        
+                        # 라디안 → 도 변환
+                        lat_deg = math.degrees(lat_rad)
+                        lon_deg = math.degrees(lon_rad)
+                        
+                        # 유효성 검사
+                        if -90 <= lat_deg <= 90 and -180 <= lon_deg <= 180:
+                            points.append((lat_deg, lon_deg))
+                            
+                            # 웨이포인트 이름 찾기 (타임스탬프 다음 줄)
+                            wp_name = None
+                            if i + 4 < len(lines):
+                                name_line = lines[i + 4].strip()
+                                # 이름이 있고, 숫자만 있는 게 아니면
+                                if name_line and not name_line.isdigit() and not name_line.startswith('['):
+                                    wp_name = name_line
+                            
+                            waypoint_names.append(wp_name or f"WPT{len(points)}")
+                            
+                            i += 4  # 기본 블록 건너뛰기
+                            continue
+                    
+                    except ValueError:
+                        pass
+            
+            i += 1
+        
+        return RouteParseResult(
+            points=points,
+            format_name='SAM ATLAS (Wärtsilä)',
+            route_name=route_name,
+            waypoint_names=waypoint_names,
+            metadata={
+                'system': 'SAM Electronics / Wärtsilä ECDIS',
+                'coordinate_format': 'radians'
+            }
+        )
+    
+    except Exception as e:
+        return RouteParseResult(
+            points=[],
+            format_name='SAM ATLAS',
             metadata={'error': str(e)}
         )
 
