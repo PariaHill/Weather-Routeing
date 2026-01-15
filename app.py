@@ -93,15 +93,16 @@ VESSEL_TYPE_PARAMS = {
 }
 
 class VesselData:
-    """선박 제원 데이터"""
+    """선박 제원 데이터 - Admiralty Coefficient 기반 범용 모델"""
     def __init__(self, vessel_type, displacement, windage_area_side, 
-                 loa, breadth, draft, speed_knots):
+                 loa, breadth, draft, speed_knots, max_power_kw=None):
         self.vessel_type = vessel_type
         self.displacement = displacement  # 톤
         self.loa = loa  # m
         self.breadth = breadth  # m
         self.draft = draft  # m
-        self.speed_knots = speed_knots  # 노트
+        self.speed_knots = speed_knots  # 서비스 속도 (노트)
+        self.max_power_kw = max_power_kw  # 총 엔진 출력 (kW)
         
         # 선종별 파라미터 가져오기
         params = VESSEL_TYPE_PARAMS.get(vessel_type, VESSEL_TYPE_PARAMS['General Cargo'])
@@ -126,6 +127,39 @@ class VesselData:
         else:
             # 비현실적인 값이면 선종별 기본값 사용
             self.cb = params['typical_cb']
+        
+        # Admiralty Coefficient (Cw) 계산
+        # Cw = (Δ^(2/3) × V^3) / P
+        # Δ: 배수량(톤), V: 속력(knots), P: 출력(kW)
+        self.propulsion_efficiency = 0.7  # 추진 효율 (권장값)
+        
+        if max_power_kw and max_power_kw > 0:
+            # 사용자가 출력을 입력한 경우: Cw 계산
+            self.admiralty_coeff = (displacement ** (2/3) * speed_knots ** 3) / max_power_kw
+            
+            # 동적 기저 저항 역산: R_base = (P × η) / V
+            V_ms = speed_knots * 0.5144  # knots → m/s
+            P_watts = max_power_kw * 1000  # kW → W
+            self.base_resistance_kn = (P_watts * self.propulsion_efficiency) / V_ms / 1000  # kN
+        else:
+            # 출력 미입력: 경험적 Cw 추정 (선종/배수량 기반)
+            # 일반적인 Cw 범위: 400~600 (대형선일수록 높음)
+            if displacement < 10000:
+                estimated_cw = 350 + (displacement / 100)
+            elif displacement < 50000:
+                estimated_cw = 450 + (displacement / 500)
+            else:
+                estimated_cw = 550 + (displacement / 2000)
+            
+            self.admiralty_coeff = estimated_cw
+            
+            # 역산으로 출력 추정: P = (Δ^(2/3) × V^3) / Cw
+            self.max_power_kw = (displacement ** (2/3) * speed_knots ** 3) / estimated_cw
+            
+            # 동적 기저 저항 계산
+            V_ms = speed_knots * 0.5144
+            P_watts = self.max_power_kw * 1000
+            self.base_resistance_kn = (P_watts * self.propulsion_efficiency) / V_ms / 1000
 
 class WeatherPoint:
     """기상 데이터 포인트"""
@@ -389,8 +423,8 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
     """
     Step 4: 기상 및 해류 영향을 반영하여 DR 재계산 (트랙 라인 위에서만)
     
-    계산 흐름:
-    1. 바람/파도 저항 → 실효 대수속력(STW) 계산
+    계산 흐름 (Admiralty Coefficient 기반):
+    1. 에너지 평형식으로 실효 대수속력(STW) 계산
     2. RTOFS 해류 데이터 조회 → 대지속력(SOG) 계산
     3. SOG 기반으로 실제 이동 거리 및 ETA 계산
     
@@ -411,10 +445,12 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
         'heading': heading,
         'weather': dr_positions[0].get('weather'),
         'weather_available': dr_positions[0].get('weather_available', True),
-        'stw': vessel.speed_knots,  # Speed Through Water
-        'sog': vessel.speed_knots,  # Speed Over Ground
+        'stw': vessel.speed_knots,
+        'sog': vessel.speed_knots,
         'speed_loss': 0,
-        'current_effect': 0
+        'current_effect': 0,
+        'added_resistance': 0,
+        'engine_load': 100.0
     })
     
     # 각 구간별로 속도 계산하여 위치 재계산
@@ -428,7 +464,6 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
         
         # 해류 데이터 조회 (RTOFS)
         current_data = None
-        current_effect = 0.0
         try:
             current_data = get_rtofs_current(prev_point['lat'], prev_point['lon'], 
                                             prev_point['time'])
@@ -436,13 +471,24 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
             pass
         
         if weather_available and weather:
-            # 기상 데이터 있음: 속도 손실 및 해류 영향 계산
-            speed_loss, current_effect = calculate_speed_loss(vessel, weather, 
-                                                              prev_point['heading'],
-                                                              current_data)
+            # 기상 데이터 있음: 에너지 평형식으로 실효 속도 계산
+            eff_result = calculate_effective_speed(vessel, weather, 
+                                                   prev_point['heading'],
+                                                   current_data)
+            stw = eff_result['stw']
+            sog = eff_result['sog']
+            speed_loss = eff_result['speed_loss']
+            current_effect = eff_result['current_effect']
+            added_resistance = eff_result['added_resistance']
+            engine_load = eff_result['engine_load']
         else:
             # 기상 데이터 없음
+            stw = vessel.speed_knots
             speed_loss = 0
+            added_resistance = 0
+            engine_load = 100.0
+            current_effect = 0.0
+            
             # 해류만 있으면 해류 영향 계산
             if current_data and 'u_current' in current_data:
                 u = current_data.get('u_current', 0)
@@ -450,16 +496,9 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
                 heading_rad = math.radians(prev_point['heading'])
                 current_along = u * math.sin(heading_rad) + v * math.cos(heading_rad)
                 current_effect = current_along * 1.94384
-        
-        # 실효 대수속력 (STW) - 바람/파도 영향
-        # speed_loss가 음수면 추진력으로 속력 증가
-        stw = vessel.speed_knots - speed_loss
-        stw = max(stw, 3.0)  # 최소 3노트 (조종 가능 속력)
-        stw = min(stw, vessel.speed_knots * 1.05)  # 최대 5% 증가 제한
-        
-        # 대지속력 (SOG) - 해류 영향 추가
-        sog = stw + current_effect
-        sog = max(sog, 1.0)  # 최소 1노트 (극단적 역조에서도 전진)
+            
+            sog = stw + current_effect
+            sog = max(sog, 1.0)
         
         # 이 구간 동안 항해한 거리 (대지속력 기준)
         distance_this_interval = sog * interval_hours
@@ -486,10 +525,12 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
                 'weather_available': orig_point.get('weather_available', True),
                 'stw': stw,
                 'sog': sog,
-                'actual_speed': sog,  # 호환성 유지
+                'actual_speed': sog,
                 'speed_loss': speed_loss,
                 'current_effect': current_effect,
-                'current_data': current_data
+                'current_data': current_data,
+                'added_resistance': added_resistance,
+                'engine_load': engine_load
             })
             break
         
@@ -510,10 +551,12 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
             'weather_available': orig_point.get('weather_available', True),
             'stw': stw,
             'sog': sog,
-            'actual_speed': sog,  # 호환성 유지
+            'actual_speed': sog,
             'speed_loss': speed_loss,
             'current_effect': current_effect,
-            'current_data': current_data
+            'current_data': current_data,
+            'added_resistance': added_resistance,
+            'engine_load': engine_load
         })
     
     # 마지막 포인트가 도착점이 아니면 도착점 추가
@@ -525,7 +568,6 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
         
         # 해류 데이터
         current_data = None
-        current_effect = 0.0
         try:
             current_data = get_rtofs_current(last_point['lat'], last_point['lon'],
                                             last_point['time'])
@@ -533,21 +575,30 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
             pass
         
         if weather_available and weather:
-            speed_loss, current_effect = calculate_speed_loss(vessel, weather, 
-                                                              last_point['heading'],
-                                                              current_data)
+            eff_result = calculate_effective_speed(vessel, weather, 
+                                                   last_point['heading'],
+                                                   current_data)
+            stw = eff_result['stw']
+            sog = eff_result['sog']
+            speed_loss = eff_result['speed_loss']
+            current_effect = eff_result['current_effect']
+            added_resistance = eff_result['added_resistance']
+            engine_load = eff_result['engine_load']
         else:
+            stw = vessel.speed_knots
             speed_loss = 0
+            added_resistance = 0
+            engine_load = 100.0
+            current_effect = 0.0
+            
             if current_data and 'u_current' in current_data:
                 u = current_data.get('u_current', 0)
                 v = current_data.get('v_current', 0)
                 heading_rad = math.radians(last_point['heading'])
                 current_along = u * math.sin(heading_rad) + v * math.cos(heading_rad)
                 current_effect = current_along * 1.94384
-        
-        stw = max(vessel.speed_knots - speed_loss, 3.0)
-        stw = min(stw, vessel.speed_knots * 1.05)
-        sog = max(stw + current_effect, 1.0)
+            
+            sog = max(stw + current_effect, 1.0)
         
         time_to_arrival = last_point['distance_remaining'] / sog
         arrival_time = last_point['time'] + timedelta(hours=time_to_arrival)
@@ -567,7 +618,9 @@ def recalculate_dr_with_weather(dr_positions: List[Dict], track: TrackLine,
             'actual_speed': sog,
             'speed_loss': speed_loss,
             'current_effect': current_effect,
-            'current_data': current_data
+            'current_data': current_data,
+            'added_resistance': added_resistance,
+            'engine_load': engine_load
         })
     
     return new_dr
@@ -1040,13 +1093,12 @@ def calculate_wave_resistance(vessel: VesselData, wave_height: float,
     """
     파랑저항 계산 (kN) - 파랑 에너지 밀도 이론 기반
     
-    공식: R_wave = C × ρ × g × H² × (B/L) × direction_factor × type_factor
+    공식: R_wave = C × ρ × g × H² × B × (B/L) × direction_factor × type_factor
     
-    - H²: 파랑 에너지는 파고의 제곱에 비례
-    - B/L: 선폭/전장 비율 (넓고 짧은 선박일수록 저항 증가)
-    - cos 기반 방향 계수로 선미파 추진 효과 반영
-    
-    음수 반환 가능 (선미파 = 추진력)
+    물리 법칙 준수:
+    - H²: 파랑 에너지는 파고의 제곱에 비례 (선형파 이론)
+    - 선미파 시 음수 반환 (추진력)
+    - max(0, ...) 제약 없음
     """
     if wave_height is None or wave_height < 0.3:
         return 0.0
@@ -1058,14 +1110,14 @@ def calculate_wave_resistance(vessel: VesselData, wave_height: float,
     
     relative_angle_rad = math.radians(relative_angle)
     
-    # cos 기반 방향 계수
+    # cos 기반 방향 계수 (추진력 반영)
     # 정선수파(0°) = +1.0 (최대 저항)
-    # 횡파(90°) = 0 (저항 없음, 실제로는 롤링만)
-    # 정선미파(180°) = -0.3 (추진력, 하지만 서핑 효과는 제한적)
+    # 횡파(90°) = 0
+    # 정선미파(180°) = -0.3 (추진력)
     if relative_angle <= 90:
         direction_factor = math.cos(relative_angle_rad)
     else:
-        # 선미파: 추진 효과 있으나 제한적 (서핑 효과)
+        # 선미파: 서핑 효과에 의한 추진력
         direction_factor = -0.3 * math.cos(math.pi - relative_angle_rad)
     
     # 물리 상수
@@ -1075,19 +1127,20 @@ def calculate_wave_resistance(vessel: VesselData, wave_height: float,
     # 선형 계수
     B = vessel.breadth
     L = vessel.loa
-    BL_ratio = B / L  # 일반적으로 0.1 ~ 0.2
+    BL_ratio = B / L
     
-    # 방형비척계수 보정 (비대선일수록 저항 증가)
-    cb_factor = 0.8 + (vessel.cb * 0.4)  # Cb 0.5 → 1.0, Cb 0.85 → 1.14
+    # 방형비척계수 보정
+    cb_factor = 0.8 + (vessel.cb * 0.4)
     
     # 선종별 계수
     type_factor = getattr(vessel, 'wave_resistance_factor', 1.0)
     
-    # 경험 계수 (튜닝 파라미터)
-    C = 0.5
+    # 경험 계수 (배수량 스케일링 포함)
+    # 대형선일수록 상대적으로 파랑 영향 감소
+    scale_factor = 1.0 / (1.0 + vessel.displacement / 100000)
+    C = 0.5 * (1.0 + scale_factor)
     
     # 파랑저항 공식: R = C × ρ × g × H² × B × (B/L) × factors
-    # 단위: kg/m³ × m/s² × m² × m × 무차원 = N
     R_wave = C * rho_water * g * (wave_height ** 2) * B * BL_ratio * direction_factor * cb_factor * type_factor
     
     return R_wave / 1000  # kN (음수 허용)
@@ -1113,87 +1166,100 @@ def calculate_swell_resistance(vessel: VesselData, swell_height: float,
     return R_base * swell_factor
 
 
-def calculate_base_resistance(vessel: VesselData) -> float:
+def calculate_effective_speed(vessel: VesselData, weather: WeatherPoint, 
+                              vessel_heading: float, current_data: Dict = None) -> Dict:
     """
-    동적 기저 저항 계산 (kN)
+    실효 속도 계산 - 에너지 평형식 기반
     
-    Froude의 저항 이론 기반:
-    R_base ∝ Displacement^(2/3) × V²
+    에너지 평형: P_available × η = (R_base + R_added) × V_eff
     
-    단위 변환 및 경험 계수 포함
+    수치해석으로 V_eff를 구함
+    
+    Returns: {
+        'stw': 대수속력 (knots),
+        'sog': 대지속력 (knots),
+        'speed_loss': 속력 손실 (knots),
+        'current_effect': 해류 영향 (knots),
+        'added_resistance': 추가 저항 (kN),
+        'engine_load': 엔진 부하율 (%),
+        'base_resistance': 기저 저항 (kN)
+    }
     """
-    # 배수량 (톤 → kg)
-    disp_kg = vessel.displacement * 1000
+    result = {
+        'stw': vessel.speed_knots,
+        'sog': vessel.speed_knots,
+        'speed_loss': 0.0,
+        'current_effect': 0.0,
+        'added_resistance': 0.0,
+        'engine_load': 100.0,
+        'base_resistance': vessel.base_resistance_kn
+    }
     
-    # 속력 (knots → m/s)
-    V_ms = vessel.speed_knots * 0.5144
+    # 추가 저항 계산 (음수 = 추진력)
+    R_added = 0.0
     
-    # Froude 기반 저항 추정
-    # R = k × Δ^(2/3) × V²
-    # k는 선형에 따른 경험 계수
-    k = 0.0012  # 튜닝 파라미터
-    
-    # 방형비척계수 보정 (비대선 = 저항 증가)
-    cb_factor = 0.85 + (vessel.cb * 0.3)
-    
-    R_base = k * (disp_kg ** (2/3)) * (V_ms ** 2) * cb_factor
-    
-    return R_base / 1000  # kN
-
-
-def calculate_speed_loss(vessel: VesselData, weather: WeatherPoint, 
-                        vessel_heading: float, current_data: Dict = None) -> Tuple[float, float]:
-    """
-    속력 손실 및 해류 영향 계산
-    
-    Returns: (speed_loss_knots, current_effect_knots)
-    
-    - speed_loss: 바람/파도에 의한 대수속력 손실 (음수 = 속력 증가)
-    - current_effect: 해류에 의한 대지속력 변화 (음수 = 역조)
-    
-    물리 법칙:
-    1. 추가 저항 계산 (음수 = 추진력)
-    2. ΔV/V = (1/3) × (ΔR/R_base)
-    3. 최대 손실 18% 제한 (상업 항로 기준)
-    """
-    total_added_resistance = 0.0
-    
-    # 풍압저항 (음수 = 추진력)
+    # 풍압저항
     if weather.wind_speed is not None and weather.wind_speed > 0.1:
         R_wind = calculate_wind_resistance(vessel, weather.wind_speed, 
                                           weather.wind_dir or 0, vessel_heading)
-        total_added_resistance += R_wind
+        R_added += R_wind
     
-    # 파랑저항 (음수 = 추진력)
+    # 파랑저항 (H² 비례)
     if weather.wave_height is not None and weather.wave_height > 0.3:
         R_wave = calculate_wave_resistance(vessel, weather.wave_height,
                                           weather.wave_dir or 0, vessel_heading)
-        total_added_resistance += R_wave
+        R_added += R_wave
     
-    # 너울저항 (음수 = 추진력)
+    # 너울저항
     if weather.swell_height is not None and weather.swell_height > 0.5:
         R_swell = calculate_swell_resistance(vessel, weather.swell_height,
                                             weather.swell_dir or weather.wave_dir or 0,
                                             vessel_heading)
-        total_added_resistance += R_swell
+        R_added += R_swell
     
-    # 동적 기저 저항
-    base_resistance = calculate_base_resistance(vessel)
-    base_resistance = max(base_resistance, 10.0)  # 최소값 보장
+    result['added_resistance'] = R_added
     
-    # 저항 비율
-    resistance_ratio = total_added_resistance / base_resistance
+    # 에너지 평형식으로 실효 속도 계산
+    # P × η = (R_base + R_added) × V_eff
+    # V_eff = (P × η) / (R_base + R_added)
     
-    # 속력 변화: ΔV/V ≈ (1/3) × (ΔR/R)
-    # 양수 = 감속, 음수 = 가속
-    speed_change_ratio = resistance_ratio / 3.0
-    speed_loss = vessel.speed_knots * speed_change_ratio
+    R_base = vessel.base_resistance_kn
+    P_available = vessel.max_power_kw * 1000  # W
+    eta = vessel.propulsion_efficiency
     
-    # 상한/하한 제한 (상업 항로 기준)
-    max_loss = vessel.speed_knots * 0.18  # 최대 18% 감속
-    max_gain = vessel.speed_knots * 0.05  # 최대 5% 가속 (추진력)
+    # 총 저항
+    R_total = R_base + R_added
     
-    speed_loss = max(-max_gain, min(speed_loss, max_loss))
+    if R_total > 0:
+        # 양의 저항: 속력 감소
+        # V_eff = (P × η) / R_total
+        V_eff_ms = (P_available * eta) / (R_total * 1000)  # m/s
+        V_eff_knots = V_eff_ms / 0.5144  # knots
+        
+        # 엔진 부하율 계산 (서비스 속도 유지에 필요한 출력 비율)
+        # 저항이 증가하면 같은 속도 유지에 더 많은 출력 필요
+        # 또는 같은 출력으로 속도 감소
+        required_power_ratio = R_total / R_base
+        result['engine_load'] = min(100.0 * required_power_ratio, 100.0)
+        
+    else:
+        # 음의 총 저항 (추진력이 저항보다 큼): 속력 증가
+        # 현실적으로는 엔진 출력 감소로 속도 유지
+        V_eff_knots = vessel.speed_knots * 1.05  # 최대 5% 증가
+        result['engine_load'] = 100.0 * (R_base / (R_base - R_added)) if R_added < 0 else 100.0
+    
+    # 속도 손실 상한선: 18%
+    max_loss = vessel.speed_knots * 0.18
+    min_speed = vessel.speed_knots - max_loss
+    
+    # 최소 속도 보장 (3 knots)
+    V_eff_knots = max(V_eff_knots, min_speed, 3.0)
+    
+    # 최대 속도 제한 (5% 증가)
+    V_eff_knots = min(V_eff_knots, vessel.speed_knots * 1.05)
+    
+    result['stw'] = V_eff_knots
+    result['speed_loss'] = vessel.speed_knots - V_eff_knots
     
     # 해류 영향 계산
     current_effect = 0.0
@@ -1208,13 +1274,29 @@ def calculate_speed_loss(vessel: VesselData, weather: WeatherPoint,
             ship_v = math.cos(heading_rad)  # 북쪽 성분
             
             # 해류의 선박 진행 방향 성분 (내적)
-            # 양수 = 순조 (속력 증가), 음수 = 역조 (속력 감소)
             current_along_track = u_curr * ship_u + v_curr * ship_v
             
             # m/s → knots 변환
             current_effect = current_along_track * 1.94384
     
-    return speed_loss, current_effect
+    result['current_effect'] = current_effect
+    result['sog'] = V_eff_knots + current_effect
+    
+    # SOG 최소값 보장
+    result['sog'] = max(result['sog'], 1.0)
+    
+    return result
+
+
+# Legacy 함수 유지 (호환성)
+def calculate_speed_loss(vessel: VesselData, weather: WeatherPoint, 
+                        vessel_heading: float, current_data: Dict = None) -> Tuple[float, float]:
+    """
+    [Legacy] 속력 손실 및 해류 영향 계산
+    새 코드는 calculate_effective_speed() 사용 권장
+    """
+    result = calculate_effective_speed(vessel, weather, vessel_heading, current_data)
+    return result['speed_loss'], result['current_effect']
 
 
 def ms_to_knots(ms: float) -> float:
@@ -1260,17 +1342,17 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
         .weather-table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 13px;
+            font-size: 12px;
         }
         .weather-table th {
             background-color: #f0f2f6;
-            padding: 6px 8px;
+            padding: 5px 6px;
             text-align: left;
             border-bottom: 2px solid #ddd;
             white-space: nowrap;
         }
         .weather-table td {
-            padding: 6px 8px;
+            padding: 5px 6px;
             border-bottom: 1px solid #eee;
             white-space: nowrap;
         }
@@ -1287,10 +1369,10 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
             color: #999;
             font-style: italic;
         }
-        .positive-current {
+        .positive-value {
             color: #28a745;
         }
-        .negative-current {
+        .negative-value {
             color: #dc3545;
         }
         .arrow-cell {
@@ -1307,14 +1389,17 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
         <thead>
             <tr>
                 <th>ETA (UTC)</th>
-                <th>Latitude</th>
-                <th>Longitude</th>
-                <th>Course</th>
-                <th>Pressure</th>
+                <th>Lat</th>
+                <th>Lon</th>
+                <th>Crs</th>
+                <th>Press</th>
                 <th>Wind</th>
                 <th>Wave</th>
                 <th>Max<br>Wave</th>
                 <th>Current</th>
+                <th>R_add<br>(kN)</th>
+                <th>Load<br>(%)</th>
+                <th>Curr<br>Effect</th>
                 <th>STW</th>
                 <th>Est<br>Speed</th>
             </tr>
@@ -1340,6 +1425,11 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
         else:
             course_str = "N/A"
         
+        # Added Resistance, Engine Load, Current Effect 기본값
+        added_r_str = "N/A"
+        load_str = "N/A"
+        curr_effect_str = "N/A"
+        
         if not weather_available:
             # 기상 데이터 없음: NIL 표시
             pressure = f'<span class="{nil_class}">NIL</span>'
@@ -1347,6 +1437,9 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
             wave_str = f'<span class="{nil_class}">NIL</span>'
             max_wave_str = f'<span class="{nil_class}">NIL</span>'
             current_str = f'<span class="{nil_class}">NIL</span>'
+            added_r_str = f'<span class="{nil_class}">NIL</span>'
+            load_str = f'<span class="{nil_class}">NIL</span>'
+            curr_effect_str = f'<span class="{nil_class}">NIL</span>'
             # STW는 대수속력 사용
             stw_str = f"{speed_knots:.1f}" if speed_knots else "N/A"
             est_speed_str = f"{speed_knots:.1f}" if speed_knots else "N/A"
@@ -1384,11 +1477,38 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
                 current_speed_ms = current_data['current_speed']
                 current_dir = current_data['current_dir']
                 current_speed_kt = current_speed_ms * 1.94384  # m/s to knots
-                # 가는 방향이므로 화살표는 180도 반대로 (↓가 아래를 가리키므로, 해류 방향으로 회전)
+                # 가는 방향이므로 화살표는 180도 반대로
                 current_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({current_dir + 180}deg);">↓</span>'
                 current_str = f'{current_arrow} {current_dir:.0f}° / {current_speed_kt:.1f}kt'
             else:
                 current_str = "N/A"
+            
+            # Added Resistance (kN)
+            added_r = point.get('added_resistance', 0)
+            if added_r > 0:
+                added_r_str = f'<span class="negative-value">+{added_r:.1f}</span>'
+            elif added_r < 0:
+                added_r_str = f'<span class="positive-value">{added_r:.1f}</span>'
+            else:
+                added_r_str = "0.0"
+            
+            # Engine Load (%)
+            engine_load = point.get('engine_load', 100.0)
+            if engine_load > 100:
+                load_str = f'<span class="negative-value">{engine_load:.0f}</span>'
+            elif engine_load < 95:
+                load_str = f'<span class="positive-value">{engine_load:.0f}</span>'
+            else:
+                load_str = f"{engine_load:.0f}"
+            
+            # Current Effect (kts)
+            curr_effect = point.get('current_effect', 0)
+            if curr_effect > 0.1:
+                curr_effect_str = f'<span class="positive-value">+{curr_effect:.1f}</span>'
+            elif curr_effect < -0.1:
+                curr_effect_str = f'<span class="negative-value">{curr_effect:.1f}</span>'
+            else:
+                curr_effect_str = "0.0"
             
             # STW (Speed Through Water)
             stw = point.get('stw', point.get('actual_speed', 0))
@@ -1409,6 +1529,9 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
                 <td>{wave_str}</td>
                 <td>{max_wave_str}</td>
                 <td>{current_str}</td>
+                <td>{added_r_str}</td>
+                <td>{load_str}</td>
+                <td>{curr_effect_str}</td>
                 <td>{stw_str}</td>
                 <td>{est_speed_str}</td>
             </tr>
@@ -1611,7 +1734,8 @@ if 'initialized' not in st.session_state:
     st.session_state.loa = load_from_storage('loa', 115.0)
     st.session_state.breadth = load_from_storage('breadth', 20.0)
     st.session_state.draft = load_from_storage('draft', 5.5)
-    st.session_state.speed_knots = load_from_storage('speed_knots', 11.0)
+    st.session_state.max_power_kw = load_from_storage('max_power_kw', 3200.0)  # 엔진 출력 (kW)
+    st.session_state.speed_knots = load_from_storage('speed_knots', 11.5)
     st.session_state.interval_idx = load_from_storage('interval_idx', 1)  # 6시간 (기본값)
     st.session_state.dep_tz_idx = load_from_storage('dep_tz_idx', 12)  # UTC+0
     st.session_state.arr_tz_idx = load_from_storage('arr_tz_idx', 21)  # UTC+9
@@ -1680,14 +1804,30 @@ with st.sidebar:
         save_to_storage('draft', draft)
     
     st.markdown("---")
-    st.header("Voyage Data")
+    st.header("Engine & Speed")
     
-    speed_knots = st.number_input("Speed through water (knots)", min_value=1.0, 
+    max_power_kw = st.number_input("Engine Power (kW)", min_value=100.0, 
+                                   value=float(st.session_state.max_power_kw), step=100.0,
+                                   key="input_power",
+                                   help="Total engine output power. Used for Admiralty Coefficient calculation.")
+    if max_power_kw != st.session_state.max_power_kw:
+        st.session_state.max_power_kw = max_power_kw
+        save_to_storage('max_power_kw', max_power_kw)
+    
+    speed_knots = st.number_input("Service Speed (knots)", min_value=1.0, 
                                   value=float(st.session_state.speed_knots), step=0.5,
-                                  key="input_speed")
+                                  key="input_speed",
+                                  help="Speed through water at full engine power.")
     if speed_knots != st.session_state.speed_knots:
         st.session_state.speed_knots = speed_knots
         save_to_storage('speed_knots', speed_knots)
+    
+    # Admiralty Coefficient 표시
+    temp_vessel = VesselData(vessel_type, displacement, windage_side, loa, breadth, draft, speed_knots, max_power_kw)
+    st.caption(f"Cw: {temp_vessel.admiralty_coeff:.0f} | R_base: {temp_vessel.base_resistance_kn:.1f} kN")
+    
+    st.markdown("---")
+    st.header("Voyage Data")
     
     # DR Interval 선택
     interval_idx = st.selectbox("DR Interval (hours)", options=range(len(INTERVAL_OPTIONS)),
@@ -1766,7 +1906,7 @@ with st.expander("📁 Upload GPX Track & Actions", expanded=upload_expanded):
 
 if calculate_button and gpx_file:
     try:
-        # Vessel data 생성 (선종 기반)
+        # Vessel data 생성 (Admiralty Coefficient 기반)
         vessel = VesselData(
             vessel_type=vessel_type,
             displacement=displacement,
@@ -1774,15 +1914,16 @@ if calculate_button and gpx_file:
             loa=loa,
             breadth=breadth,
             draft=draft,
-            speed_knots=speed_knots
+            speed_knots=speed_knots,
+            max_power_kw=max_power_kw
         )
         
         # 계산 과정을 expander 안에 표시
         progress_expander = st.expander("⚙️ Calculation Progress", expanded=True)
         
         with progress_expander:
-            # 선박 정보 표시
-            st.info(f"🚢 Vessel: {vessel_type} | Cb: {vessel.cb:.3f} | Wave Factor: {vessel.wave_resistance_factor}")
+            # 선박 정보 표시 (Admiralty Coefficient 포함)
+            st.info(f"🚢 Vessel: {vessel_type} | Cb: {vessel.cb:.3f} | Cw: {vessel.admiralty_coeff:.0f} | R_base: {vessel.base_resistance_kn:.1f}kN")
             
             st.info("📍 Parsing GPX track...")
             track_points = parse_gpx(gpx_file)
