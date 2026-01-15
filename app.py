@@ -1313,12 +1313,10 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
                 <th>Pressure</th>
                 <th>Wind</th>
                 <th>Wave</th>
-                <th>Max Wave</th>
-                <th>Sailed</th>
-                <th>Remain</th>
-                <th>STW</th>
+                <th>Max<br>Wave</th>
                 <th>Current</th>
-                <th>SOG</th>
+                <th>STW</th>
+                <th>Est<br>Speed</th>
             </tr>
         </thead>
         <tbody>
@@ -1348,10 +1346,10 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
             wind_str = f'<span class="{nil_class}">NIL</span>'
             wave_str = f'<span class="{nil_class}">NIL</span>'
             max_wave_str = f'<span class="{nil_class}">NIL</span>'
+            current_str = f'<span class="{nil_class}">NIL</span>'
             # STW는 대수속력 사용
             stw_str = f"{speed_knots:.1f}" if speed_knots else "N/A"
-            current_str = f'<span class="{nil_class}">NIL</span>'
-            sog_str = f"{speed_knots:.1f}" if speed_knots else "N/A"
+            est_speed_str = f"{speed_knots:.1f}" if speed_knots else "N/A"
         else:
             # Pressure (Pa -> hPa 변환, 소수점 없이)
             if weather and weather.pressure:
@@ -1380,25 +1378,25 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
                 wave_str = "N/A"
                 max_wave_str = "N/A"
             
+            # Current with arrow (가는 방향! 바람/파도와 반대)
+            current_data = point.get('current_data', {})
+            if current_data and 'current_speed' in current_data and 'current_dir' in current_data:
+                current_speed_ms = current_data['current_speed']
+                current_dir = current_data['current_dir']
+                current_speed_kt = current_speed_ms * 1.94384  # m/s to knots
+                # 가는 방향이므로 화살표는 180도 반대로 (↓가 아래를 가리키므로, 해류 방향으로 회전)
+                current_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({current_dir + 180}deg);">↓</span>'
+                current_str = f'{current_arrow} {current_dir:.0f}° / {current_speed_kt:.1f}kt'
+            else:
+                current_str = "N/A"
+            
             # STW (Speed Through Water)
             stw = point.get('stw', point.get('actual_speed', 0))
             stw_str = f"{stw:.1f}"
             
-            # Current effect
-            current_effect = point.get('current_effect', 0)
-            if current_effect > 0.1:
-                current_str = f'<span class="positive-current">+{current_effect:.1f}</span>'
-            elif current_effect < -0.1:
-                current_str = f'<span class="negative-current">{current_effect:.1f}</span>'
-            else:
-                current_str = "0.0"
-            
-            # SOG (Speed Over Ground)
+            # Est Speed (SOG - Speed Over Ground)
             sog = point.get('sog', point.get('actual_speed', 0))
-            sog_str = f"{sog:.1f}"
-        
-        sailed = f"{point['distance_sailed']:.1f}"
-        remaining = f"{point['distance_remaining']:.1f}"
+            est_speed_str = f"{sog:.1f}"
         
         html += f'''
             <tr class="{row_class}">
@@ -1410,11 +1408,9 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
                 <td>{wind_str}</td>
                 <td>{wave_str}</td>
                 <td>{max_wave_str}</td>
-                <td>{sailed}</td>
-                <td>{remaining}</td>
-                <td>{stw_str}</td>
                 <td>{current_str}</td>
-                <td>{sog_str}</td>
+                <td>{stw_str}</td>
+                <td>{est_speed_str}</td>
             </tr>
         '''
     
