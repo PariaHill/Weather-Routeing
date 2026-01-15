@@ -372,6 +372,7 @@ def fetch_weather_for_positions(dr_positions: List[Dict], api_key: str,
             point['weather_available'] = True
             point['gfs_cycle'] = weather_data.get('cycle', 'N/A')
             point['gfs_fhour'] = weather_data.get('fhour', 0)
+            point['raw_weather_data'] = weather_data  # 디버그용
         else:
             # 예보 범위 초과 또는 GRIB 불가: NIL 처리
             point['weather'] = WeatherPoint(point['time'], point['lat'], point['lon'])
@@ -595,12 +596,13 @@ def fetch_gfswave(date_str: str, cycle: int, fhour: int, lat: float, lon: float)
 def parse_grib_data(grib_bytes: Optional[bytes], lat: float, lon: float) -> Dict:
     """GRIB2 데이터 파싱하여 딕셔너리로 반환"""
     if grib_bytes is None or len(grib_bytes) < 100:
-        return {}
+        return {'error': f'No data or too small ({len(grib_bytes) if grib_bytes else 0} bytes)'}
     
     if not GRIB_AVAILABLE:
         return {'error': 'GRIB libraries not available'}
     
     result = {}
+    result['_raw_size'] = len(grib_bytes)
     temp_path = None
     
     try:
@@ -616,6 +618,9 @@ def parse_grib_data(grib_bytes: Optional[bytes], lat: float, lon: float) -> Dict
             {},
         ]
         
+        datasets_tried = 0
+        vars_found = []
+        
         for filter_keys in filter_configs:
             try:
                 if filter_keys:
@@ -624,7 +629,8 @@ def parse_grib_data(grib_bytes: Optional[bytes], lat: float, lon: float) -> Dict
                 else:
                     ds = xr.open_dataset(temp_path, engine='cfgrib',
                                        backend_kwargs={'errors': 'ignore'})
-            except:
+                datasets_tried += 1
+            except Exception as e:
                 continue
             
             if ds is None:
@@ -637,7 +643,8 @@ def parse_grib_data(grib_bytes: Optional[bytes], lat: float, lon: float) -> Dict
             # 가장 가까운 좌표로 데이터 추출
             try:
                 ds_point = ds.sel({lat_name: lat, lon_name: lon}, method='nearest')
-            except:
+            except Exception as e:
+                ds.close()
                 continue
             
             # 변수들 추출
@@ -645,23 +652,32 @@ def parse_grib_data(grib_bytes: Optional[bytes], lat: float, lon: float) -> Dict
                 # GFS Atmosphere
                 'prmsl': 'pressure',
                 'gust': 'gust',
-                # GFS Wave
+                # GFS Wave - 다양한 변수명 처리
                 'wind': 'wind_speed',
                 'wdir': 'wind_dir',
                 'u10': 'wind_u',
                 'v10': 'wind_v',
+                'u': 'wind_u',
+                'v': 'wind_v',
                 'ugrd': 'wind_u',
                 'vgrd': 'wind_v',
                 'htsgw': 'wave_height',
+                'swh': 'wave_height',
                 'dirpw': 'wave_dir',
+                'mwd': 'wave_dir',
                 'perpw': 'wave_period',
+                'mwp': 'wave_period',
                 'swell': 'swell_height',
+                'shts': 'swell_height',
                 'swdir': 'swell_dir',
+                'mdts': 'swell_dir',
                 'swper': 'swell_period',
+                'mpts': 'swell_period',
             }
             
             for var_name in ds_point.data_vars:
                 var_lower = var_name.lower()
+                vars_found.append(var_name)
                 for grib_var, result_key in var_mapping.items():
                     if grib_var in var_lower:
                         try:
@@ -673,6 +689,9 @@ def parse_grib_data(grib_bytes: Optional[bytes], lat: float, lon: float) -> Dict
                         break
             
             ds.close()
+        
+        result['_datasets_tried'] = datasets_tried
+        result['_vars_found'] = vars_found
         
     except Exception as e:
         result['parse_error'] = str(e)
@@ -1512,9 +1531,18 @@ if calculate_button and gpx_file:
                     sample_point = initial_dr[1]
                     st.write("**GFS Cycle:**", sample_point.get('gfs_cycle', 'N/A'))
                     st.write("**Forecast Hour:**", sample_point.get('gfs_fhour', 'N/A'))
+                    st.write("**Raw Weather Data:**", sample_point.get('raw_weather_data', 'N/A'))
                     
                     weather = sample_point.get('weather')
                     if weather:
+                        st.write("**Parsed Weather:**")
+                        st.write(f"  - Pressure: {weather.pressure}")
+                        st.write(f"  - Wind: {weather.wind_dir}° / {weather.wind_speed} m/s")
+                        st.write(f"  - Gust: {weather.wind_gust} m/s")
+                        st.write(f"  - Wave: {weather.wave_dir}° / {weather.wave_height} m")
+                        st.write(f"  - Swell: {weather.swell_dir}° / {weather.swell_height} m")
+                    else:
+                        st.write("**Weather object is None**")
                         st.write("**Weather Data:**")
                         st.write(f"  - Pressure: {weather.pressure}")
                         st.write(f"  - Wind: {weather.wind_dir}° / {weather.wind_speed} m/s")
