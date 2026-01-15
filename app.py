@@ -1892,13 +1892,12 @@ with st.expander("📁 Upload Route File & Actions", expanded=upload_expanded):
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        # 지원 형식 목록
+        # 지원 형식 목록 (확장자 없는 파일도 허용하기 위해 type 제한 제거)
         if ROUTE_PARSER_AVAILABLE:
-            supported_types = get_supported_formats()
             route_file = st.file_uploader(
                 "Choose a route file", 
-                type=supported_types,
-                help="Supported: GPX, RTZ (IEC 61174), Furuno ROU, CSV/TXT, JSON"
+                type=None,  # 모든 파일 허용 (SAM ATLAS 등 확장자 없는 파일 지원)
+                help="Supported: GPX, RTZ, Furuno ROU, SAM ATLAS, CSV/TXT, GeoJSON"
             )
         else:
             route_file = st.file_uploader("Choose a GPX file", type=['gpx'])
