@@ -1091,14 +1091,18 @@ def calculate_wind_resistance(vessel: VesselData, wind_speed_ms: float,
 def calculate_wave_resistance(vessel: VesselData, wave_height: float, 
                               wave_dir: float, vessel_heading: float) -> float:
     """
-    파랑저항 계산 (kN) - 파랑 에너지 밀도 이론 기반
+    파랑저항 계산 (kN) - Simplified Kwon/Fujii-Takahashi 방법 기반
     
-    공식: R_wave = C × ρ × g × H² × B × (B/L) × direction_factor × type_factor
+    공식: R_wave = (1/16) × ρ × g × H² × B² / L × Caw × direction_factor
+    
+    여기서:
+    - (1/16) × ρ × g × H²: 파랑 에너지 밀도 (J/m²)
+    - B² / L: 선박 형상 계수 (m)
+    - Caw: 파랑저항 계수 (무차원, 0.5~2.0)
     
     물리 법칙 준수:
     - H²: 파랑 에너지는 파고의 제곱에 비례 (선형파 이론)
     - 선미파 시 음수 반환 (추진력)
-    - max(0, ...) 제약 없음
     """
     if wave_height is None or wave_height < 0.3:
         return 0.0
@@ -1110,15 +1114,16 @@ def calculate_wave_resistance(vessel: VesselData, wave_height: float,
     
     relative_angle_rad = math.radians(relative_angle)
     
-    # cos 기반 방향 계수 (추진력 반영)
+    # cos² 기반 방향 계수 (더 현실적인 분포)
     # 정선수파(0°) = +1.0 (최대 저항)
     # 횡파(90°) = 0
-    # 정선미파(180°) = -0.3 (추진력)
+    # 정선미파(180°) = -0.15 (약간의 추진력)
     if relative_angle <= 90:
-        direction_factor = math.cos(relative_angle_rad)
+        # cos² 사용: 횡파에서 급격히 감소
+        direction_factor = math.cos(relative_angle_rad) ** 2
     else:
-        # 선미파: 서핑 효과에 의한 추진력
-        direction_factor = -0.3 * math.cos(math.pi - relative_angle_rad)
+        # 선미파: 서핑 효과에 의한 약한 추진력
+        direction_factor = -0.15 * math.cos(math.pi - relative_angle_rad) ** 2
     
     # 물리 상수
     rho_water = 1025  # kg/m³
@@ -1127,21 +1132,24 @@ def calculate_wave_resistance(vessel: VesselData, wave_height: float,
     # 선형 계수
     B = vessel.breadth
     L = vessel.loa
-    BL_ratio = B / L
     
-    # 방형비척계수 보정
-    cb_factor = 0.8 + (vessel.cb * 0.4)
-    
-    # 선종별 계수
+    # 파랑저항 계수 Caw (무차원)
+    # 선종, Cb, 속도에 따라 0.5 ~ 2.0 범위
+    # 비대선(높은 Cb)일수록, 저속선일수록 증가
+    base_caw = 1.0
+    cb_factor = 0.7 + (vessel.cb * 0.6)  # Cb 0.6 → 1.06, Cb 0.85 → 1.21
     type_factor = getattr(vessel, 'wave_resistance_factor', 1.0)
     
-    # 경험 계수 (배수량 스케일링 포함)
-    # 대형선일수록 상대적으로 파랑 영향 감소
-    scale_factor = 1.0 / (1.0 + vessel.displacement / 100000)
-    C = 0.5 * (1.0 + scale_factor)
+    # 배수량 스케일링: 대형선일수록 상대적 영향 감소
+    # 115m급 8000톤 기준으로 정규화
+    scale_factor = (8000 / vessel.displacement) ** 0.3 if vessel.displacement > 0 else 1.0
+    scale_factor = max(0.5, min(scale_factor, 1.5))  # 0.5 ~ 1.5 범위 제한
     
-    # 파랑저항 공식: R = C × ρ × g × H² × B × (B/L) × factors
-    R_wave = C * rho_water * g * (wave_height ** 2) * B * BL_ratio * direction_factor * cb_factor * type_factor
+    Caw = base_caw * cb_factor * type_factor * scale_factor
+    
+    # 파랑저항 공식: R = (1/16) × ρ × g × H² × B² / L × Caw × direction_factor
+    # 단위: (kg/m³) × (m/s²) × (m²) × (m²/m) × 1 = kg⋅m/s² = N
+    R_wave = (1/16) * rho_water * g * (wave_height ** 2) * (B ** 2) / L * Caw * direction_factor
     
     return R_wave / 1000  # kN (음수 허용)
 
