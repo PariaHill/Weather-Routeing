@@ -12,6 +12,13 @@ from folium.plugins import AntPath
 import tempfile
 import os
 
+# Track/Route parser module
+try:
+    from track_parser import parse_route_file, get_supported_formats, get_format_descriptions, RouteParseResult
+    ROUTE_PARSER_AVAILABLE = True
+except ImportError:
+    ROUTE_PARSER_AVAILABLE = False
+
 # GRIB2 처리용 (NOAA GFS)
 try:
     import xarray as xr
@@ -385,10 +392,6 @@ def fetch_weather_for_positions(dr_positions: List[Dict], api_key: str,
     
     # GFS 사이클 캐시 (한 번만 찾기)
     gfs_cache = {}
-    
-    # GRIB 라이브러리 가용성 체크
-    if not GRIB_AVAILABLE:
-        st.warning("⚠️ GRIB libraries (xarray, cfgrib) not available. Install with: pip install xarray cfgrib eccodes")
     
     for i, point in enumerate(dr_positions):
         status_text.text(f"Fetching NOAA GFS data: {i+1}/{len(dr_positions)}")
@@ -1399,16 +1402,12 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
                 <th>ETA (UTC)</th>
                 <th>Lat</th>
                 <th>Lon</th>
-                <th>Crs</th>
+                <th>Co.</th>
                 <th>Press</th>
                 <th>Wind</th>
                 <th>Wave</th>
                 <th>Max<br>Wave</th>
                 <th>Current</th>
-                <th>R_add<br>(kN)</th>
-                <th>Load<br>(%)</th>
-                <th>Curr<br>Effect</th>
-                <th>STW</th>
                 <th>Est<br>Speed</th>
             </tr>
         </thead>
@@ -1489,7 +1488,7 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
                 current_arrow = f'<span class="arrow-svg" style="display:inline-block; transform:rotate({current_dir + 180}deg);">↓</span>'
                 current_str = f'{current_arrow} {current_dir:.0f}° / {current_speed_kt:.1f}kt'
             else:
-                current_str = "N/A"
+                current_str = "No Data"
             
             # Added Resistance (kN)
             added_r = point.get('added_resistance', 0)
@@ -1537,10 +1536,6 @@ def create_results_table_html(dr_positions: List[Dict], speed_knots: float = Non
                 <td>{wave_str}</td>
                 <td>{max_wave_str}</td>
                 <td>{current_str}</td>
-                <td>{added_r_str}</td>
-                <td>{load_str}</td>
-                <td>{curr_effect_str}</td>
-                <td>{stw_str}</td>
                 <td>{est_speed_str}</td>
             </tr>
         '''
@@ -1886,33 +1881,33 @@ with st.sidebar:
     departure_datetime = departure_local - timedelta(hours=departure_tz)
     
     st.markdown("---")
-    # NOAA GFS는 API 키 불필요
-    st.info("🌐 Data Source: NOAA GFS (No API key required)")
-    if GRIB_AVAILABLE:
-        st.success("✅ GRIB libraries available")
-    else:
-        st.warning("⚠️ GRIB libraries not installed. Run: pip install xarray cfgrib eccodes")
+    st.caption("🌐 Data Source: NOAA GFS")
     
     # 호환성을 위해 api_key 변수 유지 (NOAA는 사용 안함)
     api_key = "NOAA_GFS"
-    
-    st.markdown("---")
-    st.header("Debug Options")
-    show_debug = st.checkbox("Show API response details", value=False)
 
 # Main area - 계산 완료 후에는 접힌 상태로
 upload_expanded = not st.session_state.calculation_done
-with st.expander("📁 Upload GPX Track & Actions", expanded=upload_expanded):
+with st.expander("📁 Upload Route File & Actions", expanded=upload_expanded):
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        gpx_file = st.file_uploader("Choose a GPX file", type=['gpx'])
+        # 지원 형식 목록
+        if ROUTE_PARSER_AVAILABLE:
+            supported_types = get_supported_formats()
+            route_file = st.file_uploader(
+                "Choose a route file", 
+                type=supported_types,
+                help="Supported: GPX, RTZ (IEC 61174), Furuno ROU, CSV/TXT, JSON"
+            )
+        else:
+            route_file = st.file_uploader("Choose a GPX file", type=['gpx'])
     
     with col2:
         st.markdown("<br>", unsafe_allow_html=True)  # 간격 조정
         calculate_button = st.button("🧭 Calculate Route", type="primary", use_container_width=True)
 
-if calculate_button and gpx_file:
+if calculate_button and route_file:
     try:
         # Vessel data 생성 (Admiralty Coefficient 기반)
         vessel = VesselData(
@@ -1933,18 +1928,32 @@ if calculate_button and gpx_file:
             # 선박 정보 표시 (Admiralty Coefficient 포함)
             st.info(f"🚢 Vessel: {vessel_type} | Cb: {vessel.cb:.3f} | Cw: {vessel.admiralty_coeff:.0f} | R_base: {vessel.base_resistance_kn:.1f}kN")
             
-            st.info("📍 Parsing GPX track...")
-            track_points = parse_gpx(gpx_file)
-            
-            if len(track_points) == 0:
-                st.error("❌ No track points found in GPX file. Please check the file contains tracks, routes, or waypoints.")
-                st.stop()
+            # 루트 파일 파싱 (다중 형식 지원)
+            st.info("📍 Parsing route file...")
+            if ROUTE_PARSER_AVAILABLE:
+                try:
+                    result = parse_route_file(route_file, route_file.name)
+                    if not result.is_valid:
+                        error_msg = result.metadata.get('error', 'Unknown parsing error')
+                        st.error(f"❌ Failed to parse file: {error_msg}")
+                        st.stop()
+                    track_points = result.points
+                    st.success(f"✅ Loaded {len(track_points)} waypoints from {result.format_name} file")
+                    if result.route_name:
+                        st.caption(f"Route: {result.route_name}")
+                except Exception as e:
+                    st.error(f"❌ {str(e)}")
+                    st.stop()
+            else:
+                track_points = parse_gpx(route_file)
+                if len(track_points) == 0:
+                    st.error("❌ No track points found in GPX file. Please check the file contains tracks, routes, or waypoints.")
+                    st.stop()
+                st.success(f"✅ Loaded {len(track_points)} track points")
             
             if len(track_points) < 2:
                 st.error("❌ At least 2 points are required for routing.")
                 st.stop()
-            
-            st.success(f"✅ Loaded {len(track_points)} track points")
             
             # TrackLine 객체 생성
             track = TrackLine(track_points)
@@ -1968,30 +1977,6 @@ if calculate_button and gpx_file:
             no_weather_count = sum(1 for p in initial_dr if not p.get('weather_available', True))
             if no_weather_count > 0:
                 st.warning(f"⚠️ {no_weather_count} positions are beyond weather forecast range (shown as NIL)")
-            
-            # 디버그: NOAA GFS 응답 확인
-            if show_debug and initial_dr and len(initial_dr) > 1:
-                with st.expander("🔍 Debug: NOAA GFS Response", expanded=True):
-                    sample_point = initial_dr[1]
-                    st.write("**GFS Cycle:**", sample_point.get('gfs_cycle', 'N/A'))
-                    st.write("**Forecast Hour:**", sample_point.get('gfs_fhour', 'N/A'))
-                    st.write("**Raw Weather Data:**", sample_point.get('raw_weather_data', 'N/A'))
-                    
-                    weather = sample_point.get('weather')
-                    if weather:
-                        st.write("**Parsed Weather:**")
-                        st.write(f"  - Pressure: {weather.pressure}")
-                        st.write(f"  - Wind: {weather.wind_dir}° / {weather.wind_speed} m/s")
-                        st.write(f"  - Gust: {weather.wind_gust} m/s")
-                        st.write(f"  - Wave: {weather.wave_dir}° / {weather.wave_height} m")
-                        st.write(f"  - Swell: {weather.swell_dir}° / {weather.swell_height} m")
-                    else:
-                        st.write("**Weather object is None**")
-                        st.write("**Weather Data:**")
-                        st.write(f"  - Pressure: {weather.pressure}")
-                        st.write(f"  - Wind: {weather.wind_dir}° / {weather.wind_speed} m/s")
-                        st.write(f"  - Wave: {weather.wave_dir}° / {weather.wave_height} m")
-                        st.write(f"  - Swell: {weather.swell_dir}° / {weather.swell_height} m")
             
             # Step 4: 기상 영향 반영하여 DR 재계산
             st.info("🔄 Recalculating DR with weather effects...")
@@ -2055,8 +2040,8 @@ if calculate_button and gpx_file:
         st.exception(e)
 
 elif calculate_button:
-    if not gpx_file:
-        st.warning("⚠️ Please upload a GPX file")
+    if not route_file:
+        st.warning("⚠️ Please upload a route file")
 
 # 이전 계산 결과가 있으면 표시 (새로 계산하지 않은 경우)
 elif st.session_state.calculation_done and 'final_dr' in st.session_state and not calculate_button:
